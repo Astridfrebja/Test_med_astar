@@ -277,8 +277,10 @@ class OccupancyGridManager:
         if not self.is_map_available():
             return (0, 0)
         
-        map_x = int((world_x - self.map_msg.info.origin.position.x) / self.map_msg.info.resolution)
-        map_y = int((world_y - self.map_msg.info.origin.position.y) / self.map_msg.info.resolution)
+        # Merk: Kartdata er lagret rad-major som (x=row/height, y=col/width).
+        # Verdens x tilsvarer kolonne (y), og verdens y tilsvarer rad (x).
+        map_x = int((world_y - self.map_msg.info.origin.position.y) / self.map_msg.info.resolution)
+        map_y = int((world_x - self.map_msg.info.origin.position.x) / self.map_msg.info.resolution)
         
         return (map_x, map_y)
 

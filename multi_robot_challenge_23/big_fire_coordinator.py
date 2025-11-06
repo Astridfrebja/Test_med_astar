@@ -146,7 +146,21 @@ class BigFireCoordinator:
         pass
 
     def get_target_position(self) -> tuple:
-        """Hent målposisjon for navigasjon"""
+        """Hent målposisjon for navigasjon
+        
+        Hvis lederen allerede er ved brannen, bruk lederens posisjon i stedet for ArUco merket sin posisjon.
+        Dette sikrer at supporteren navigerer til riktig side av veggen.
+        """
+        # Hvis supporteren skal navigere og lederen er ved brannen, bruk lederens posisjon
+        if self.memory.my_role == self.memory.SUPPORTER and \
+           self.memory.other_robot_at_fire and \
+           self.memory.big_fire_state == self.memory.SUPPORTER_GOING_TO_FIRE:
+            # Lederen er ved brannen - bruk lederens posisjon i stedet for ArUco merket
+            # Vi bruker Big Fire posisjonen som referanse, men A* vil justere den til lederens faktiske posisjon
+            # via leader_position_callback
+            return self.memory.big_fire_position
+        
+        # Ellers bruk ArUco merket sin posisjon (eller Big Fire posisjon)
         return self.memory.big_fire_position
 
     def should_handle_big_fire(self) -> bool:

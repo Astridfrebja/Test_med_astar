@@ -1,48 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+AStarNavigator - Refaktorert versjon som bruker separate klasser
+
+Single Responsibility: Koordinerer A* pathfinding og path following
+"""
+
 import math
-import heapq
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
-from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
-from std_msgs.msg import ColorRGBA
 from .path_visualizer import PathVisualizer
 from .visited_tracker import VisitedTracker
-from .path_visualizer import PathVisualizer
-from .visited_tracker import VisitedTracker
+from .astar_pathfinder import AStarPathfinder
+from .path_planner import PathPlanner
+from .path_follower import PathFollower
+from .recovery_handler import RecoveryHandler
+
 
 class AStarNavigator:
     """
     A* Pathfinding Navigator - Planlegger optimal rute gjennom kartet
     
-    Single Responsibility: A* pathfinding og path following
+    Single Responsibility: Koordinerer A* pathfinding og path following
     """
     
     # --- INNSTILLINGER ---
-    FORWARD_SPEED = 0.3
-    TURN_SPEED = 0.5
-    WAYPOINT_THRESHOLD = 0.3  # meters til waypoint er nådd
-    GOAL_THRESHOLD = 0.5  # meters til endelig mål er nådd
-    P_GAIN = 1.5  # P-kontroll for heading
-    OBSTACLE_THRESHOLD = 0.4  # meter til hindring (mer konservativt)
-    INFLATION_RADIUS = 1  # Grid cells å inflere rundt hindringer (redusert fra 2 for mindre streng traversability)
     REPLAN_INTERVAL_SEC = 1.0  # hvor ofte vi periodisk replanlegger
-    STUCK_TIME_SEC = 2.0       # hvor lenge uten fremdrift før recovery
-    STUCK_PROGRESS_EPS = 0.10  # meter forbedring som teller som fremdrift
-    BLOCKED_LIMIT = 15         # antall påfølgende sykluser med blokkert front før fallback
     
-    def __init__(self, node_ref: Node, sensor_manager=None, occupancy_grid_manager=None):
+    def __init__(self, node_ref: Node, sensor_manager=None, occupancy_grid_manager=None, leader_position_callback=None):
         self.node = node_ref
         self.sensor_manager = sensor_manager
         self.occupancy_grid_manager = occupancy_grid_manager
+        self.leader_position_callback = leader_position_callback
         
         # Hent robot ID for visualisering
         self.robot_id = self.node.get_namespace().strip('/')
         
-        # Path planning
+        # Path planning state
         self.path = []  # List of (x, y) waypoints i world koordinater
         self.current_waypoint_idx = 0
         self.target_position = None
@@ -55,14 +51,6 @@ class AStarNavigator:
         # Visualization counter for periodic updates
         self.viz_counter = 0
         self.last_plan_time = 0.0
-        self.last_progress_time = 0.0
-        self.last_progress_dist = float('inf')
-        self.blocked_counter = 0
-        
-        # Recovery state
-        self.recovering = False
-        self.recovery_phase = None  # 'back' eller 'turn'
-        self.recovery_phase_end = 0.0
         
         # Setup publisher
         self.cmd_vel_publisher = self.node.create_publisher(Twist, 'cmd_vel', 10)
@@ -71,9 +59,23 @@ class AStarNavigator:
         self.path_visualizer = PathVisualizer(self.node, self.robot_id)
         self.visited_tracker = VisitedTracker(self.node, self.robot_id, self.occupancy_grid_manager)
         
-        # Visualisering og besøks-sporing (SRP)
-        self.path_visualizer = PathVisualizer(self.node, self.robot_id)
-        self.visited_tracker = VisitedTracker(self.node, self.robot_id, self.occupancy_grid_manager)
+        # Opprett komponenter
+        self.path_planner = PathPlanner(self.node, self.occupancy_grid_manager, leader_position_callback)
+        self.path_follower = PathFollower(self.node, self.sensor_manager, self.cmd_vel_publisher)
+        
+        # Setup A* pathfinder med callbacks
+        self.pathfinder = AStarPathfinder(
+            self.node,
+            is_traversable_callback=self.path_planner.is_traversable,
+            get_neighbors_callback=self.path_planner.get_neighbors
+        )
+        
+        # Setup recovery handler
+        self.recovery_handler = RecoveryHandler(
+            self.node,
+            publish_twist_callback=self.path_follower.publish_twist,
+            plan_path_callback=self.plan_path
+        )
         
         self.node.get_logger().info(f'⭐ AStarNavigator ({self.robot_id}) initialisert')
     
@@ -98,12 +100,11 @@ class AStarNavigator:
     def clear_goal(self):
         """Fjern aktivt mål og rute"""
         self.target_position = None
-        self.navigation_active = False
         self.path = []
         self.current_waypoint_idx = 0
-        # Slett visualisering ved å publisere DELETE markers
+        self.navigation_active = False
         self.path_visualizer.publish([])
-        self.node.get_logger().info(f'⭐ ({self.robot_id}): Mål og rute fjernet')
+        self.stop_robot()
     
     def update_robot_pose(self, position: tuple, orientation: float):
         """Oppdater robot posisjon og orientering"""
@@ -122,7 +123,7 @@ class AStarNavigator:
             return False
         
         if not self.occupancy_grid_manager.is_map_available():
-            self.node.get_logger().warn('⭐ A*: Ingen map tilgjengelig for pathfinding. Sjekk om map_server kjører og publiserer på /map topic.')
+            self.node.get_logger().warn('⭐ A*: Ingen map tilgjengelig for pathfinding.')
             return False
         
         if not self.target_position:
@@ -132,7 +133,6 @@ class AStarNavigator:
         # Sjekk at robot_position er satt
         if not self.robot_position or self.robot_position == (0.0, 0.0):
             self.node.get_logger().warn(f'⭐ A*: Robot position er ikke satt eller er (0,0): {self.robot_position}')
-            # Ikke return False - kan være at vi faktisk starter på (0,0)
         
         # Konverter start og mål til map koordinater
         self.node.get_logger().info(f'⭐ A*: Planlegger rute. Robot pos: {self.robot_position}, Target: {self.target_position}')
@@ -147,8 +147,8 @@ class AStarNavigator:
         self.node.get_logger().info(f'⭐ A*: Map koordinater - start={start_map}, goal={goal_map}')
         
         # Debug: Sjekk traversability for start og goal
-        start_traversable = self.is_traversable(start_map[0], start_map[1])
-        goal_traversable = self.is_traversable(goal_map[0], goal_map[1])
+        start_traversable = self.path_planner.is_traversable(start_map[0], start_map[1])
+        goal_traversable = self.path_planner.is_traversable(goal_map[0], goal_map[1])
         start_occupancy = self.occupancy_grid_manager.get_occupancy_value(start_map[0], start_map[1])
         goal_occupancy = self.occupancy_grid_manager.get_occupancy_value(goal_map[0], goal_map[1])
         
@@ -161,270 +161,96 @@ class AStarNavigator:
             f'goal_traversable={goal_traversable} (occ={goal_occupancy})'
         )
         
+        # Viktig: Sjekk at start er traversable
+        if not start_traversable:
+            self.node.get_logger().error(
+                f'⭐ A*: START er ikke traversable! occ={start_occupancy}, '
+                f'start_map={start_map}, start_world={self.robot_position}'
+            )
+            # Prøv å finne nærmeste traversable punkt til start
+            adjusted_start = self.path_planner.find_nearest_traversable(start_map, max_search_radius=5)
+            if adjusted_start:
+                start_map = adjusted_start
+                self.node.get_logger().warn(f'⭐ A*: Justert start til {start_map}')
+            else:
+                self.node.get_logger().error('⭐ A*: Kunne ikke finne traversable start!')
+                return False
+        
+        # Hvis målet er på en hindring, finn nærmeste traversable punkt
+        if not goal_traversable:
+            self.node.get_logger().warn(f'⭐ A*: Målet er på en hindring! Søker etter nærmeste traversable punkt...')
+            
+            # Først: Prøv å bruke lederens posisjon hvis tilgjengelig (for Big Fire scenario)
+            leader_pos = None
+            if self.leader_position_callback:
+                try:
+                    leader_pos = self.leader_position_callback()
+                except Exception as e:
+                    self.node.get_logger().debug(f'⭐ A*: Kunne ikke hente lederens posisjon: {e}')
+            
+            if leader_pos:
+                # Lederen er ved brannen - bruk lederens posisjon direkte som mål
+                # i stedet for ArUco merket sin posisjon (som er på veggen)
+                leader_map = self.occupancy_grid_manager.world_to_map(leader_pos[0], leader_pos[1])
+                leader_traversable = self.path_planner.is_traversable(leader_map[0], leader_map[1])
+                
+                if leader_traversable:
+                    # Lederens posisjon er traversable - bruk den direkte
+                    goal_map = leader_map
+                    self.target_position = leader_pos
+                    self.node.get_logger().info(f'⭐ A*: Bruker lederens posisjon direkte (ikke ArUco merket): map={goal_map}, world={self.target_position}')
+                else:
+                    # Lederens posisjon er ikke traversable - finn nærmeste traversable punkt
+                    adjusted_goal = self.path_planner.find_nearest_traversable_towards_goal(start_map, leader_map, max_search_radius=15)
+                    if adjusted_goal:
+                        goal_map = adjusted_goal
+                        self.target_position = self.occupancy_grid_manager.map_to_world(goal_map[0], goal_map[1])
+                        self.node.get_logger().info(f'⭐ A*: Bruker punkt nær lederen (riktig side av veggen): map={goal_map}, world={self.target_position}')
+                    else:
+                        # Fallback: prøv vanlig søk
+                        adjusted_goal = self.path_planner.find_nearest_traversable(leader_map, max_search_radius=10)
+                        if adjusted_goal:
+                            goal_map = adjusted_goal
+                            self.target_position = self.occupancy_grid_manager.map_to_world(goal_map[0], goal_map[1])
+                            self.node.get_logger().warn(f'⭐ A*: Fallback - bruker punkt nær lederen: map={goal_map}, world={self.target_position}')
+                        else:
+                            self.node.get_logger().error('⭐ A*: Kunne ikke finne traversable punkt nær lederen!')
+                            return False
+            else:
+                # Ingen leder-posisjon tilgjengelig: finn nærmeste traversable punkt i retning fra roboten til målet
+                adjusted_goal = self.path_planner.find_nearest_traversable_towards_goal(start_map, goal_map, max_search_radius=15)
+                if adjusted_goal:
+                    goal_map = adjusted_goal
+                    self.target_position = self.occupancy_grid_manager.map_to_world(goal_map[0], goal_map[1])
+                    self.node.get_logger().info(f'⭐ A*: Justert mål til traversable punkt i retning: map={goal_map}, world={self.target_position}')
+                else:
+                    self.node.get_logger().error('⭐ A*: Kunne ikke finne traversable punkt!')
+                    return False
+        
         # Kjør A* algoritmen
-        path_map = self.astar_search(start_map, goal_map)
+        self.node.get_logger().info(f'⭐ A*: Starter søk fra {start_map} til {goal_map}')
+        map_info = self.occupancy_grid_manager.get_map_info()
+        path_map = self.pathfinder.search(start_map, goal_map, map_info['height'], map_info['width'])
         
         if not path_map:
-            self.node.get_logger().warn('⭐ A* fant ingen rute')
+            self.node.get_logger().warn(f'⭐ A* fant ingen rute fra {start_map} til {goal_map}')
             return False
+        
+        self.node.get_logger().info(f'⭐ A*: Søk fullført, fikk path med {len(path_map)} punkter')
         
         # Konverter path til world koordinater og reduser antall waypoints
-        self.path = self.smooth_path(path_map)
+        self.path = self.path_planner.smooth_path(path_map)
         self.current_waypoint_idx = 0
         
-        return True
-    
-    def astar_search(self, start: tuple, goal: tuple) -> list:
-        """
-        A* søkealgoritme
-        
-        Args:
-            start: (map_x, map_y) startposisjon
-            goal: (map_x, map_y) målposisjon
-        
-        Returns:
-            list: Path som liste av (map_x, map_y) koordinater, eller []
-        """
-        # A* datastrukturer
-        open_set = []  # Priority queue (f_score, counter, node)
-        heapq.heappush(open_set, (0, 0, start))
-        
-        came_from = {}  # node -> parent node
-        g_score = {start: 0}  # node -> cost from start
-        f_score = {start: self.heuristic(start, goal)}  # node -> estimated total cost
-        
-        counter = 0  # For å bryte likhet i priority queue
-        closed_set = set()
-        
-        map_info = self.occupancy_grid_manager.get_map_info()
-        max_x = map_info['height']
-        max_y = map_info['width']
-        
-        while open_set:
-            _, _, current = heapq.heappop(open_set)
-            
-            # Sjekk om vi har nådd målet - mer fleksibel sjekk
-            dist_to_goal = self.distance(current, goal)
-            if dist_to_goal < 3.0:  # Økt fra 2.0 for å tillate nærliggende celler nær vegger
-                # Rekonstruer path
-                path = self.reconstruct_path(came_from, current)
-                # Legg til goal hvis ikke allerede inkludert
-                if len(path) == 0 or path[-1] != goal:
-                    path.append(goal)
-                self.node.get_logger().info(f'⭐ A* fant rute med {len(path)} steg (distance til goal: {dist_to_goal:.2f})')
-                return path
-            
-            if current in closed_set:
-                continue
-            
-            closed_set.add(current)
-            
-            # Utforsk naboer (8-retnings bevegelse)
-            for neighbor in self.get_neighbors(current, max_x, max_y):
-                if neighbor in closed_set:
-                    continue
-                
-                # Sjekk om nabo er traverserbar
-                if not self.is_traversable(neighbor[0], neighbor[1]):
-                    continue
-                
-                # Beregn tentativ g_score
-                tentative_g = g_score[current] + self.distance(current, neighbor)
-                
-                if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                    # Denne ruten til neighbor er bedre
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g
-                    f = tentative_g + self.heuristic(neighbor, goal)
-                    f_score[neighbor] = f
-                    
-                    counter += 1
-                    heapq.heappush(open_set, (f, counter, neighbor))
-        
-        # Ingen rute funnet - debug informasjon
-        self.node.get_logger().warn(f'⭐ A* søk fullført uten å finne rute. Utforsket {len(closed_set)} noder.')
-        # Prøv å finne nærmeste traversable celle til goal
-        best_node = None
-        best_dist = float('inf')
-        for node in closed_set:
-            if self.is_traversable(node[0], node[1]):
-                dist = self.distance(node, goal)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_node = node
-        
-        if best_node:
-            self.node.get_logger().info(f'⭐ Nærmeste traversable node til goal: {best_node}, avstand: {best_dist:.2f}')
-            # Returner path til nærmeste traversable node
-            path = self.reconstruct_path(came_from, best_node)
-            path.append(goal)  # Legg til goal selv om ikke traversable
-            return path
-        
-        return []
-    
-    def get_neighbors(self, node: tuple, max_x: int, max_y: int) -> list:
-        """
-        Få naboer til en node (8-retninger)
-        
-        Args:
-            node: (map_x, map_y)
-            max_x, max_y: Map dimensjoner
-        
-        Returns:
-            list: Liste av nabo-koordinater
-        """
-        x, y = node
-        neighbors = []
-        
-        # 8-retnings bevegelse
-        directions = [
-            (-1, 0), (1, 0), (0, -1), (0, 1),  # Cardinal
-            (-1, -1), (-1, 1), (1, -1), (1, 1)  # Diagonal
-        ]
-        
-        for dx, dy in directions:
-            nx, ny = x + dx, y + dy
-            
-            # Sjekk bounds
-            if 0 <= nx < max_x and 0 <= ny < max_y:
-                neighbors.append((nx, ny))
-        
-        return neighbors
-    
-    def is_traversable(self, map_x: int, map_y: int) -> bool:
-        """
-        Sjekk om en map celle er traverserbar (ikke hindring)
-        
-        Args:
-            map_x, map_y: Map koordinater
-        
-        Returns:
-            bool: True hvis traverserbar
-        """
-        # Sjekk bounds
-        map_info = self.occupancy_grid_manager.get_map_info()
-        if map_x < 0 or map_x >= map_info['height'] or map_y < 0 or map_y >= map_info['width']:
-            return False
-        
-        # Sjekk om selve cellen er fri eller unknown (unknown behandles som traversable)
-        occupancy = self.occupancy_grid_manager.get_occupancy_value(map_x, map_y)
-        if occupancy == -1:
-            # Unknown område - behandles som traversable
-            return True
-        if occupancy > 50:  # Obstacle threshold
-            return False
-        
-        # Sjekk inflated område rundt (for robot safety margin) - kun sjekker nærmeste naboer
-        if self.INFLATION_RADIUS > 0:
-            for dx in range(-self.INFLATION_RADIUS, self.INFLATION_RADIUS + 1):
-                for dy in range(-self.INFLATION_RADIUS, self.INFLATION_RADIUS + 1):
-                    if dx == 0 and dy == 0:
-                        continue
-                    
-                    check_x = map_x + dx
-                    check_y = map_y + dy
-                    
-                    # Sjekk bounds først
-                    if check_x < 0 or check_x >= map_info['height'] or check_y < 0 or check_y >= map_info['width']:
-                        continue
-                    
-                    # Hvis det er en hindring i nærheten, marker som ikke traverserbar
-                    check_occupancy = self.occupancy_grid_manager.get_occupancy_value(check_x, check_y)
-                    if check_occupancy > 50:  # Obstacle threshold
-                        return False
+        # Logg at path er satt
+        self.node.get_logger().info(
+            f'⭐ A*: Path satt! path_len={len(self.path)}, '
+            f'first_waypoint={self.path[0] if self.path else None}, '
+            f'last_waypoint={self.path[-1] if self.path else None}, '
+            f'robot_pos={self.robot_position}'
+        )
         
         return True
-    
-    def heuristic(self, a: tuple, b: tuple) -> float:
-        """
-        Heuristisk funksjon for A* (Euclidean distance)
-        
-        Args:
-            a, b: (map_x, map_y) koordinater
-        
-        Returns:
-            float: Estimert avstand
-        """
-        return self.distance(a, b)
-    
-    def distance(self, a: tuple, b: tuple) -> float:
-        """
-        Beregn Euclidean distance mellom to punkter
-        
-        Args:
-            a, b: (x, y) koordinater
-        
-        Returns:
-            float: Avstand
-        """
-        return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
-    
-    def reconstruct_path(self, came_from: dict, current: tuple) -> list:
-        """
-        Rekonstruer path fra came_from map
-        
-        Args:
-            came_from: Dictionary mapping node -> parent node
-            current: Sluttnode
-        
-        Returns:
-            list: Path som liste av (map_x, map_y) koordinater
-        """
-        path = [current]
-        while current in came_from:
-            current = came_from[current]
-            path.append(current)
-        path.reverse()
-        return path
-    
-    def smooth_path(self, path_map: list) -> list:
-        """
-        Glatt ut path og konverter til world koordinater
-        Reduserer antall waypoints ved å kun beholde hjørnepunkter
-        
-        Args:
-            path_map: Path i map koordinater
-        
-        Returns:
-            list: Smoothed path i world koordinater
-        """
-        if len(path_map) <= 2:
-            # For korte paths, konverter bare direkte
-            return [
-                self.occupancy_grid_manager.map_to_world(x, y) 
-                for x, y in path_map
-            ]
-        
-        # Douglas-Peucker-lignende forenkling
-        # Beholder kun waypoints der retningen endrer seg betydelig
-        smoothed = [path_map[0]]  # Behold start
-        
-        for i in range(1, len(path_map) - 1):
-            prev = path_map[i - 1]
-            current = path_map[i]
-            next_point = path_map[i + 1]
-            
-            # Beregn retningsendring
-            dir1 = (current[0] - prev[0], current[1] - prev[1])
-            dir2 = (next_point[0] - current[0], next_point[1] - current[1])
-            
-            # Hvis retningen endrer seg, behold waypoint
-            if dir1 != dir2:
-                # Kun ta med hvert 3. punkt for å redusere støy
-                if i % 3 == 0 or self.distance(prev, current) > 5:
-                    smoothed.append(current)
-        
-        smoothed.append(path_map[-1])  # Behold mål
-        
-        # Konverter til world koordinater
-        world_path = [
-            self.occupancy_grid_manager.map_to_world(x, y) 
-            for x, y in smoothed
-        ]
-        
-        self.node.get_logger().info(f'⭐ Path smoothed fra {len(path_map)} til {len(world_path)} waypoints')
-        
-        return world_path
     
     def navigate_to_goal(self, msg: LaserScan = None) -> bool:
         """
@@ -437,6 +263,10 @@ class AStarNavigator:
             bool: True hvis endelig mål er nådd
         """
         if not self.navigation_active:
+            if not hasattr(self, '_last_inactive_log') or \
+               (self.node.get_clock().now().nanoseconds / 1e9 - getattr(self, '_last_inactive_log', 0.0)) > 2.0:
+                self.node.get_logger().warn('⭐ A*: navigation_active er False - venter på aktivering')
+                self._last_inactive_log = self.node.get_clock().now().nanoseconds / 1e9
             return False
         
         # Publiser visualisering periodisk (hver 10. gang ≈ 1Hz hvis scan er 10Hz)
@@ -456,6 +286,16 @@ class AStarNavigator:
                     self.path = []
         
         if not self.path:
+            # Logg sjeldent for å indikere at path er tom (mulig fallback)
+            if not hasattr(self, '_last_empty_path_log'):
+                self._last_empty_path_log = 0.0
+            if (now_sec - getattr(self, '_last_empty_path_log', 0.0)) > 1.5:
+                self.node.get_logger().warn(
+                    f'⭐ A*: Ingen aktiv path – venter/replanlegger. '
+                    f'Robot pos: {self.robot_position}, Target: {self.target_position}, '
+                    f'Active: {self.navigation_active}'
+                )
+                self._last_empty_path_log = now_sec
             return False
         
         # Sjekk om vi har nådd endelig mål
@@ -464,7 +304,7 @@ class AStarNavigator:
             (self.target_position[1] - self.robot_position[1])**2
         )
         
-        if distance_to_goal <= self.GOAL_THRESHOLD:
+        if distance_to_goal <= PathFollower.GOAL_THRESHOLD:
             self.node.get_logger().info('⭐ ENDELIG MÅL NÅDD!')
             self.stop_robot()
             return True
@@ -482,7 +322,7 @@ class AStarNavigator:
                 (current_waypoint[1] - self.robot_position[1])**2
             )
             
-            if distance_to_waypoint <= self.WAYPOINT_THRESHOLD:
+            if distance_to_waypoint <= PathFollower.WAYPOINT_THRESHOLD:
                 self.current_waypoint_idx += 1
                 self.node.get_logger().info(
                     f'⭐ Waypoint {self.current_waypoint_idx}/{len(self.path)} nådd'
@@ -495,334 +335,58 @@ class AStarNavigator:
                     current_waypoint = self.path[self.current_waypoint_idx]
         
         # STUCK detection og recovery før navigasjon
-        if self._should_recover(distance_to_goal):
-            self._do_recovery()
+        if self.recovery_handler.should_recover(distance_to_goal, now_sec):
+            recovery_done = self.recovery_handler.do_recovery(now_sec)
+            if recovery_done:
+                # Recovery ferdig - replan path
+                planned = self.plan_path()
+                self.last_plan_time = now_sec
+                if not planned:
+                    self.path = []
+                    self.navigation_active = False
             return False
         
+        # Debug: Log path status første gang eller ved endringer
+        if not hasattr(self, '_last_path_status_log') or \
+           (now_sec - getattr(self, '_last_path_status_log', 0.0)) > 2.0:
+            self.node.get_logger().info(
+                f'⭐ A* NAVIGATING: path_len={len(self.path)}, '
+                f'waypoint_idx={self.current_waypoint_idx}, '
+                f'robot_pos={self.robot_position}, '
+                f'waypoint={current_waypoint}, '
+                f'dist_to_goal={distance_to_goal:.2f}m'
+            )
+            self._last_path_status_log = now_sec
+        
         # Naviger mot nåværende waypoint
-        self.navigate_to_waypoint(current_waypoint, msg)
+        linear_x, angular_z, should_fallback = self.path_follower.navigate_to_waypoint(
+            current_waypoint, self.robot_position, self.robot_orientation, msg
+        )
+        
+        if should_fallback:
+            # Tving fallback til Bug2 i koordinator
+            self.node.get_logger().warn('⭐ A*: Front blokkert lenge – tvinger fallback (tømmer path)')
+            self.path = []
+            self.navigation_active = False
+            self.path_follower.reset_blocked_counter()
+            return False
+        
+        # Publiser kommandoer
+        self.path_follower.publish_twist(linear_x, angular_z)
         
         # Oppdater fremdrift
-        if (self.last_progress_dist - distance_to_goal) >= self.STUCK_PROGRESS_EPS:
-            self.last_progress_dist = distance_to_goal
-            self.last_progress_time = now_sec
+        self.recovery_handler.update_progress(distance_to_goal, now_sec)
         
         # Marker nåværende celle som besøkt
         self.visited_tracker.mark_current(self.robot_position[0], self.robot_position[1])
         
         return False
     
-    def navigate_to_waypoint(self, waypoint: tuple, msg: LaserScan = None):
-        """
-        Naviger mot et spesifikt waypoint med obstacle avoidance
-        
-        Args:
-            waypoint: (x, y) world koordinater
-            msg: LaserScan data (optional)
-        """
-        # Beregn retning til waypoint
-        dx = waypoint[0] - self.robot_position[0]
-        dy = waypoint[1] - self.robot_position[1]
-        distance_to_waypoint = math.sqrt(dx*dx + dy*dy)
-        
-        # Hent sensor data for obstacle avoidance
-        if self.sensor_manager and self.sensor_manager.is_scan_valid():
-            dF = self.sensor_manager.get_range_at_angle(0.0)
-            dL = self.sensor_manager.get_range_at_angle(+15.0)
-            dR = self.sensor_manager.get_range_at_angle(-15.0)
-        elif msg:
-            dF = self._range_at_deg(msg, 0.0)
-            dL = self._range_at_deg(msg, +15.0)
-            dR = self._range_at_deg(msg, -15.0)
-        else:
-            # Ingen sensor data
-            self.stop_robot()
-            return
-        
-        # Beregn kommandoer
-        linear_x, angular_z = self.calculate_commands(dx, dy, distance_to_waypoint, dL, dR, dF)
-        
-        # Telle blokkert front for fallback
-        if dF < self.OBSTACLE_THRESHOLD:
-            self.blocked_counter += 1
-        else:
-            self.blocked_counter = 0
-        
-        if self.blocked_counter >= self.BLOCKED_LIMIT:
-            # Tving fallback til Bug2 i koordinator
-            self.node.get_logger().warn('⭐ A*: Front blokkert lenge – tvinger fallback (tømmer path)')
-            self.path = []
-            self.navigation_active = False
-            self.blocked_counter = 0
-            return
-        
-        # Publiser kommandoer
-        self.publish_twist(linear_x, angular_z)
-    
-    def calculate_commands(self, dx: float, dy: float, distance: float,
-                          dL: float, dR: float, dF: float) -> tuple:
-        """
-        Beregn lineær og vinkelhastighet med obstacle avoidance
-        
-        Args:
-            dx, dy: Delta til waypoint
-            distance: Avstand til waypoint
-            dL, dR, dF: Sensor readings (left, right, front)
-        
-        Returns:
-            tuple: (linear_x, angular_z)
-        """
-        linear_x = 0.0
-        angular_z = 0.0
-        
-        # Obstacle avoidance har høyest prioritet
-        if dF < self.OBSTACLE_THRESHOLD:
-            # Hindring foran - sving til side med minst hinder
-            if dL > dR:
-                angular_z = self.TURN_SPEED  # Sving venstre
-            else:
-                angular_z = -self.TURN_SPEED  # Sving høyre
-            linear_x = 0.1  # Sakte fremover
-            
-            # Logg obstacle avoidance
-            if not hasattr(self, '_obstacle_log_counter'):
-                self._obstacle_log_counter = 0
-            self._obstacle_log_counter += 1
-            if self._obstacle_log_counter % 20 == 0:
-                self.node.get_logger().warn(f'⭐ Obstacle avoidance: dF={dF:.2f}m')
-        else:
-            # Ingen hinder - naviger mot waypoint
-            desired_heading = math.atan2(dy, dx)
-            heading_error = desired_heading - self.robot_orientation
-            
-            # Normaliser vinkel til [-π, π]
-            heading_error = self.normalize_angle(heading_error)
-            
-            # P-kontroll for heading
-            angular_z = self.P_GAIN * heading_error
-            
-            # Begrens angular hastighet
-            angular_z = max(min(angular_z, self.TURN_SPEED), -self.TURN_SPEED)
-            
-            # Adaptiv lineær hastighet basert på heading error
-            if abs(heading_error) > math.radians(30):
-                # Stor heading error - sving mer, kjør saktere
-                linear_x = self.FORWARD_SPEED * 0.3
-            elif abs(heading_error) > math.radians(15):
-                linear_x = self.FORWARD_SPEED * 0.6
-            else:
-                # God alignment - full fart
-                linear_x = self.FORWARD_SPEED
-            
-            # Reduser hastighet når vi nærmer oss waypoint
-            if distance < 1.0:
-                linear_x *= 0.5
-        
-        return linear_x, angular_z
-    
-    def normalize_angle(self, angle: float) -> float:
-        """Normaliser vinkel til [-π, π]"""
-        while angle > math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
-    
-    def visualize_path(self):
-        """
-        Visualiser planlagt path i RViz med robot ID i namespace for å støtte flere roboter
-        
-        Publiserer alltid (selv med tom path) for å fjerne gamle markers ved clear_goal()
-        """
-        marker_array = MarkerArray()
-        
-        # Unik namespace per robot basert på robot_id
-        path_ns = f"astar_path_{self.robot_id}"
-        waypoint_ns = f"astar_waypoints_{self.robot_id}"
-        
-        if self.path:
-            # Path line marker med robot-spesifikk namespace
-            line_marker = Marker()
-            line_marker.header.frame_id = "map"
-            line_marker.header.stamp = self.node.get_clock().now().to_msg()
-            line_marker.ns = path_ns
-            line_marker.id = 0
-            line_marker.type = Marker.LINE_STRIP
-            line_marker.action = Marker.ADD
-            line_marker.scale.x = 0.05  # Line width
-            # Forskjellig farge basert på robot ID (roterende mellom cyan og magenta)
-            if '0' in self.robot_id or '2' in self.robot_id or '4' in self.robot_id:
-                line_marker.color = ColorRGBA(r=0.0, g=1.0, b=1.0, a=1.0)  # Cyan for partall
-            else:
-                line_marker.color = ColorRGBA(r=1.0, g=0.0, b=1.0, a=1.0)  # Magenta for oddetall
-            
-            for wx, wy in self.path:
-                p = Point()
-                p.x = wx
-                p.y = wy
-                p.z = 0.1
-                line_marker.points.append(p)
-            
-            marker_array.markers.append(line_marker)
-            
-            # Waypoint markers med robot-spesifikk namespace
-            for i, (wx, wy) in enumerate(self.path):
-                wp_marker = Marker()
-                wp_marker.header.frame_id = "map"
-                wp_marker.header.stamp = self.node.get_clock().now().to_msg()
-                wp_marker.ns = waypoint_ns
-                wp_marker.id = i + 1
-                wp_marker.type = Marker.SPHERE
-                wp_marker.action = Marker.ADD
-                wp_marker.pose.position.x = wx
-                wp_marker.pose.position.y = wy
-                wp_marker.pose.position.z = 0.1
-                wp_marker.scale.x = 0.2
-                wp_marker.scale.y = 0.2
-                wp_marker.scale.z = 0.2
-                wp_marker.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0)  # Yellow
-                marker_array.markers.append(wp_marker)
-        else:
-            # Slett gamle markers ved å publisere DELETE action markers
-            delete_marker = Marker()
-            delete_marker.header.frame_id = "map"
-            delete_marker.header.stamp = self.node.get_clock().now().to_msg()
-            delete_marker.ns = path_ns
-            delete_marker.id = 0
-            delete_marker.action = Marker.DELETE
-            marker_array.markers.append(delete_marker)
-            
-            delete_waypoint = Marker()
-            delete_waypoint.header.frame_id = "map"
-            delete_waypoint.header.stamp = self.node.get_clock().now().to_msg()
-            delete_waypoint.ns = waypoint_ns
-            delete_waypoint.id = 0
-            delete_waypoint.action = Marker.DELETEALL
-            marker_array.markers.append(delete_waypoint)
-        
-        self.path_viz_pub.publish(marker_array)
-        
-        # Reduser logging for å unngå spam
-        if self.path and self.viz_counter % 50 == 0:
-            self.node.get_logger().debug(f'⭐ Path visualisert for {self.robot_id}: {len(self.path)} waypoints')
-    
-    def visualize_visited(self):
-        """Visualiser besøkte celler i RViz som små gule prikker."""
-        if not self.visited_cells:
-            return
-        marker_array = MarkerArray()
-        m = Marker()
-        m.header.frame_id = "map"
-        m.header.stamp = self.node.get_clock().now().to_msg()
-        m.ns = f"astar_visited_{self.robot_id}"
-        m.id = 0
-        m.type = Marker.SPHERE_LIST
-        m.action = Marker.ADD
-        m.scale.x = 0.08
-        m.scale.y = 0.08
-        m.scale.z = 0.08
-        m.color = ColorRGBA(r=1.0, g=1.0, b=0.2, a=0.9)
-        
-        # Konverter map-celler til world-senter
-        res = self.occupancy_grid_manager.map_msg.info.resolution if self.occupancy_grid_manager and self.occupancy_grid_manager.is_map_available() else 0.05
-        for (mx, my), count in list(self.visited_cells.items()):
-            wx, wy = self.occupancy_grid_manager.map_to_world(mx, my) if self.occupancy_grid_manager else (0.0, 0.0)
-            p = Point()
-            p.x = wx + res * 0.5
-            p.y = wy + res * 0.5
-            p.z = 0.05
-            m.points.append(p)
-        marker_array.markers.append(m)
-        self.visited_viz_pub.publish(marker_array)
-    
-    def _mark_current_cell_visited(self):
-        if not self.occupancy_grid_manager or not self.occupancy_grid_manager.is_map_available():
-            return
-        mx, my = self.occupancy_grid_manager.world_to_map(self.robot_position[0], self.robot_position[1])
-        key = (mx, my)
-        self.visited_cells[key] = self.visited_cells.get(key, 0) + 1
-    
-    def _range_at_deg(self, scan: LaserScan, deg: float, default: float = 100.0) -> float:
-        """Hent avstand ved vinkel (grader) fra LIDAR"""
-        if scan is None or not scan.ranges:
-            return default
-        
-        rad = math.radians(deg)
-        idx = int(round((rad - scan.angle_min) / scan.angle_increment))
-        
-        if idx < 0 or idx >= len(scan.ranges):
-            return default
-        
-        d = scan.ranges[idx]
-        if d is None or math.isnan(d) or math.isinf(d) or d == 0.0:
-            return default
-            
-        return float(d)
-    
     def publish_twist(self, linear_x: float, angular_z: float):
-        """Publiserer bevegelseskommandoer"""
-        twist_msg = Twist()
-        twist_msg.linear.x = linear_x
-        twist_msg.angular.z = angular_z
-        self.cmd_vel_publisher.publish(twist_msg)
+        """Publiser Twist kommando (for recovery handler)"""
+        self.path_follower.publish_twist(linear_x, angular_z)
     
     def stop_robot(self):
-        """Stopper robot bevegelse"""
-        self.publish_twist(0.0, 0.0)
-
-    # --- STUCK / RECOVERY ---
-    def _should_recover(self, distance_to_goal: float) -> bool:
-        if not hasattr(self, 'last_progress_time'):
-            return False
-        now_sec = self.node.get_clock().now().nanoseconds / 1e9
-        if self.last_progress_time == 0.0:
-            self.last_progress_time = now_sec
-            self.last_progress_dist = distance_to_goal
-            return False
-        # Hvis vi ikke har gjort nok fremdrift over tid
-        if (now_sec - self.last_progress_time) > self.STUCK_TIME_SEC and \
-           (self.last_progress_dist - distance_to_goal) < self.STUCK_PROGRESS_EPS:
-            return True
-        return self.recovering
-
-    def _do_recovery(self):
-        now_sec = self.node.get_clock().now().nanoseconds / 1e9
-        if not self.recovering:
-            # Start recovery: rygg 0.4s
-            self.recovering = True
-            self.recovery_phase = 'back'
-            self.recovery_phase_end = now_sec + 0.4
-            self.node.get_logger().warn('⭐ A*: STUCK – utfører recovery (rygg)')
-            self.publish_twist(-0.1, 0.0)
-            return
-        
-        if self.recovery_phase == 'back':
-            if now_sec >= self.recovery_phase_end:
-                # Start sving i 0.6s (≈35°)
-                self.recovery_phase = 'turn'
-                self.recovery_phase_end = now_sec + 0.6
-                self.node.get_logger().warn('⭐ A*: Recovery – roterer')
-                self.publish_twist(0.0, self.TURN_SPEED * 0.6)
-            else:
-                self.publish_twist(-0.1, 0.0)
-            return
-        
-        if self.recovery_phase == 'turn':
-            if now_sec >= self.recovery_phase_end:
-                # Recovery ferdig – be om replan og nullstill fremdrift
-                self.recovering = False
-                self.recovery_phase = None
-                self.last_progress_time = now_sec
-                self.last_progress_dist = float('inf')
-                # Tving ny plan
-                planned = self.plan_path()
-                self.last_plan_time = now_sec
-                if not planned:
-                    # Ingen plan – tøm path for å trigge fallback
-                    self.path = []
-                    self.navigation_active = False
-                self.publish_twist(0.0, 0.0)
-            else:
-                self.publish_twist(0.0, self.TURN_SPEED * 0.6)
-
+        """Stopp roboten"""
+        self.path_follower.stop_robot()
 

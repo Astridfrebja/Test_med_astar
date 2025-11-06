@@ -155,7 +155,17 @@ class WallFollower:
 
     def do_follow_wall(self):
         """Action for following wall with distance control"""
-        d_right = self.regions['right']
+        d_right = self.regions.get('right', self.MAX_RANGE)
+        d_front = self.regions.get('front', self.MAX_RANGE)
+        
+        # Hvis det ikke er noen vegg i nærheten, kjør rett frem for å finne en vegg
+        if d_right > (self.WALL_DISTANCE + 1.0) and d_front > self.FRONT_THRESHOLD:
+            twist_msg = Twist()
+            twist_msg.linear.x = self.LINEAR_SPEED
+            twist_msg.angular.z = 0.0  # Kjør rett frem
+            return twist_msg
+        
+        # Normal wall following
         error = d_right - self.WALL_DISTANCE
         angular_vel = -self.KP_ANGULAR * error
         

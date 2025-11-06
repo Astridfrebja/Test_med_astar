@@ -57,10 +57,30 @@ class SearchRescueCoordinator:
         self.bug2_navigator = Bug2Navigator(node_ref, self.wall_follower, self.goal_navigator)
         
         # A* Navigator (brukes for Big Fire navigasjon når map er tilgjengelig)
+        # Send callback for å hente lederens posisjon (hvis supporter)
+        def get_leader_position():
+            """Hent lederens posisjon hvis den er ved brannen
+            
+            Når supporteren skal gå til Big Fire og lederen allerede er ved brannen,
+            returnerer vi Big Fire posisjonen som referanse. Siden lederen er ved brannen
+            (innenfor 2m av Big Fire), er lederens faktiske posisjon nær Big Fire posisjonen,
+            men ikke på veggen (siden lederen kan stå der). A* vil finne et traversable
+            punkt nær denne posisjonen.
+            """
+            if self.robot_memory.my_role == self.robot_memory.SUPPORTER and \
+               self.robot_memory.other_robot_at_fire and \
+               self.robot_memory.big_fire_position:
+                # Lederen er ved brannen - returner Big Fire posisjon som referanse
+                # Dette er ikke ArUco merket sin posisjon, men posisjonen lederen publiserte
+                # når den oppdaget Big Fire. A* vil finne et traversable punkt nær denne.
+                return self.robot_memory.big_fire_position
+            return None
+        
         self.astar_navigator = AStarNavigator(
             node_ref, 
             self.sensor_manager, 
-            self.sensor_manager.get_occupancy_grid_manager()
+            self.sensor_manager.get_occupancy_grid_manager(),
+            leader_position_callback=get_leader_position
         )
 
         # Scoring service client
@@ -101,9 +121,8 @@ class SearchRescueCoordinator:
         # Oppdater tilstanden (viktig å gjøre FØR navigasjon sjekkes)
         self.big_fire_coordinator.update_state(self.robot_position, self.robot_orientation)
         
-        # Robust: regn også som aktivt hvis A* allerede navigerer (unngå at mål ryddes pga. timing)
-        big_fire_active = self.big_fire_coordinator.should_handle_big_fire() or \
-                          getattr(self.astar_navigator, 'navigation_active', False)
+        # Sjekk om Big Fire skal håndteres (kun basert på Big Fire state, ikke A* aktivitet)
+        big_fire_active = self.big_fire_coordinator.should_handle_big_fire()
         
         if big_fire_active:
             self.node.get_logger().debug('🔥 BIG FIRE KOORDINERING AKTIV')
@@ -128,7 +147,7 @@ class SearchRescueCoordinator:
                 map_currently_available = self.sensor_manager.is_map_available()
                 
                 # DEBUG: Log status for diagnose
-                self.node.get_logger().info(
+                self.node.get_logger().debug(
                     f'🔥 NAVIGASJON STATUS: target={target}, '
                     f'use_astar={self.use_astar_for_big_fire}, '
                     f'map_available={map_currently_available}, '
@@ -137,6 +156,12 @@ class SearchRescueCoordinator:
                 )
                 
                 if self.use_astar_for_big_fire and map_currently_available:
+                    # Sørg for at kun A* publiserer cmd_vel i denne fasen
+                    try:
+                        self.wall_follower.stop_robot()
+                        self.bug2_navigator.stop_robot()
+                    except Exception:
+                        pass
                     # Eventuell plan-pause etter mottatt beskjed
                     now_sec = self.node.get_clock().now().nanoseconds / 1e9
                     # Initier pause første gang vi kommer inn i SUPPORTER_GOING_TO_FIRE
@@ -211,12 +236,12 @@ class SearchRescueCoordinator:
                 
         else:
             # Standard utforskning (Big Fire inaktiv)
-            # Ikke rydd A* mål hvis A* er aktiv (kan være kortvarige timing-hull i meldinger)
-            if not getattr(self.astar_navigator, 'navigation_active', False):
+            # Rydd A* mål hvis det ikke skal brukes
+            if getattr(self.astar_navigator, 'navigation_active', False):
                 self.astar_navigator.clear_goal()
             self.bug2_navigator.clear_goal()
             
-            # Wall Follower fortsetter letingen
+            # Wall Follower skal alltid være aktiv når Big Fire ikke er aktiv
             self.wall_follower.follow_wall(msg) 
 
 
@@ -237,9 +262,16 @@ class SearchRescueCoordinator:
             pass
 
         # Kjør A* også på odometri for robust fremdrift (i tilfelle scan-loop hopper)
+        # Viktig: Sørg for at andre komponenter ikke publiserer når A* er aktiv
         big_fire_active = self.big_fire_coordinator.should_handle_big_fire() or \
                           getattr(self.astar_navigator, 'navigation_active', False)
         if big_fire_active and getattr(self.astar_navigator, 'navigation_active', False):
+            # A* er aktiv - stopp andre komponenter
+            try:
+                self.wall_follower.stop_robot()
+                self.bug2_navigator.stop_robot()
+            except Exception:
+                pass
             now_sec = self.node.get_clock().now().nanoseconds / 1e9
             if now_sec >= self.planning_pause_until:
                 try:
@@ -263,7 +295,10 @@ class SearchRescueCoordinator:
 
         if current_state == coordinator.memory.LEDER_WAITING:
 
-            self.node.get_logger().info('🔥 LEDER: In LEDER_WAITING state!')
+            # Logg kun ved state entry for å redusere støy
+            if not coordinator.memory.waiting_logged:
+                self.node.get_logger().info('🔥 LEDER: In LEDER_WAITING state!')
+                coordinator.memory.waiting_logged = True
 
             # Publiser AT_FIRE kun hvis lederen faktisk er ved brannen (innenfor radius)
             if not coordinator.memory.i_am_at_fire:
@@ -362,11 +397,16 @@ class SearchRescueCoordinator:
 
         if marker_id == 4:  # Big Fire
             self.node.get_logger().info(f'🔥 BIG FIRE DETECTED! Calling detect_big_fire({position})')
-            self.big_fire_coordinator.detect_big_fire(position)
+            # Viktig: Bruk robotens faktiske posisjon (ikke ArUco merket sin posisjon på veggen)
+            # siden alle ArUco merkene er på veggen, men roboten står ved siden av veggen
+            self.big_fire_coordinator.detect_big_fire(self.robot_position)
             # Kaller update_state umiddelbart for å sette i gang navigasjonen i neste process_scan
             self.big_fire_coordinator.update_state(self.robot_position, self.robot_orientation)
+            # Big Fire håndteres av Big Fire logikk - ikke start wall follower her
         else:
-            self.node.get_logger().info(f'📊 ArUco ID {marker_id} på {position} - Roboten stopper for scoring!') 
+            self.node.get_logger().info(f'📊 ArUco ID {marker_id} på {position} - Roboten stopper for scoring!')
+            # For andre markers: stopp kort, rapporter, så fortsett med wall following
+            # Wall follower vil starte automatisk i neste process_scan() siden Big Fire ikke er aktiv 
 
     def _report_marker_to_scoring(self, marker_id: int, position: tuple):
         """Call scoring service to report a found marker."""

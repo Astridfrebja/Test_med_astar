@@ -118,8 +118,10 @@ class RobotMemory:
                   self.big_fire_detected_by_other or 
                   self.big_fire_state != self.NORMAL)
         
-        # Debug logging - kan ikke bruke node.get_logger() her
-        print(f"🔥 should_handle_big_fire: detected_by_me={self.big_fire_detected_by_me}, detected_by_other={self.big_fire_detected_by_other}, state={self.big_fire_state}, result={result}")
+        # Kun print ved tilstandsendring for å redusere støy
+        if not hasattr(self, '_last_should_handle') or self._last_should_handle != result:
+            print(f"🔥 should_handle_big_fire: detected_by_me={self.big_fire_detected_by_me}, detected_by_other={self.big_fire_detected_by_other}, state={self.big_fire_state}, result={result}")
+            self._last_should_handle = result
         
         return result
 
