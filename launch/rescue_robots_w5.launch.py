@@ -5,52 +5,58 @@ from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
-
 from launch_ros.actions import Node
 
 def generate_launch_description():
     package_name = 'multi_robot_challenge_23'
 
-    # Get the path to the world, map and rviz configuration file
+    # --- 1. FILSTI-DEFINISJONER ---
     world_file_path = os.path.join(get_package_share_directory(package_name), 'worlds', 'dat160_w5.world')
     map_file_path = os.path.join(get_package_share_directory(package_name), 'maps', 'map_dat160_w5.yaml')
     rviz_config_file_path = os.path.join(get_package_share_directory(package_name), 'rviz', 'model.rviz')
 
-    # Namespace of each robot
-    first_tb3 = 'tb3_0'
-    second_tb3 = 'tb3_1'
-    # Starting position in the gazebo world of each robot
-    first_tb3_pos = ['0.0', '-0.5', '0.0']
-    second_tb3_pos = ['0.0', '-2.5', '0.0']
-    #Starting orientation in the gazebo world of each robot
-    first_tb3_yaw = '0.0'
-    second_tb3_yaw = '0.0'
+    # --- 2. ROBOTKONFIGURASJON ---
+    robot_namespaces = ['tb3_0', 'tb3_1']
+    robot_positions = [
+        ['0.0', '-0.5', '0.0'], 
+        ['0.0', '-2.5', '0.0'],
+    ]
+    robot_yaws = ['0.0', '0.0']
+    
+    # Deklarasjoner for bakoverkompatibilitet (uendret, OK)
+    first_tb3 = robot_namespaces[0]
+    second_tb3 = robot_namespaces[1] if len(robot_namespaces) > 1 else None
+    first_tb3_pos = robot_positions[0]
+    second_tb3_pos = robot_positions[1] if len(robot_positions) > 1 else None
+    first_tb3_yaw = robot_yaws[0]
+    second_tb3_yaw = robot_yaws[1] if len(robot_yaws) > 1 else '0.0'
 
-    # Declaring use_sim_time as a launch argument that can then be used in all launch files
+    # --- 3. ARGUMENTER ---
     sim_time_arg = DeclareLaunchArgument(
         'use_sim_time',
         default_value='true',
         description='Use simulation (Gazebo) clock if true'
     )
-    # Get launch argument use_sim_time as a launch configuration object
     use_sim_time = LaunchConfiguration('use_sim_time')
 
-    # Starting Gazebo
+    # --- 4. LANSERING AV HOVEDKOMPONENTER ---
+    
+    # Gazebo
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([os.path.join(get_package_share_directory('gazebo_ros'), 'launch'), '/gazebo.launch.py']),
         launch_arguments={'world': world_file_path}.items()
     )
 
-    # Starting Map Server
+    # Map Server
     map_server = Node(
         package='nav2_map_server',
         executable='map_server',
         name='map_server',
         output='screen',
         parameters=[{"yaml_filename": map_file_path, "topic_name": "map", "frame_id": "map"}],
-        # remappings=remappings
     )
-    # Starting a lifecycle manager that takes care of the map server
+    
+    # Lifecycle Manager
     lifecycle_manager = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
@@ -61,7 +67,16 @@ def generate_launch_description():
                     {'node_names': ["map_server"]}]
     )
 
-    # Spawning the first robot
+    # TF world -> map
+    tf_world_to_map = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='tf_world_to_map',
+        arguments=['0', '0', '0', '0', '0', '0', 'world', 'map'],
+        output='screen'
+    )
+
+    # --- 5. ROBOTER (Inkluderer spawn_robot.launch.py) ---
     tb3_0 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([os.path.join(get_package_share_directory(package_name), 'launch'), '/spawn_robot.launch.py']),
         launch_arguments={
@@ -69,10 +84,10 @@ def generate_launch_description():
             'x': first_tb3_pos[0],
             'y': first_tb3_pos[1],
             'yaw': first_tb3_yaw,
+            'use_sim_time': use_sim_time, # Legg til use_sim_time
         }.items()
     )
 
-    # Spawning the second robot 
     tb3_1 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([os.path.join(get_package_share_directory(package_name), 'launch'), '/spawn_robot.launch.py']),
         launch_arguments={
@@ -80,10 +95,11 @@ def generate_launch_description():
             'x': second_tb3_pos[0],
             'y': second_tb3_pos[1],
             'yaw': second_tb3_yaw,
+            'use_sim_time': use_sim_time, # Legg til use_sim_time
         }.items()
     )
 
-    # Starting rviz
+    # RViz
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
@@ -93,6 +109,7 @@ def generate_launch_description():
         output='screen'
     )
 
+    # Robot Kontroller-Noder
     robot1_node = Node(
         package=package_name,
         executable='robot_node',
@@ -111,14 +128,19 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}]
     )
 
-    return LaunchDescription([
+    # --- 6. BYGG LAUNCH DESCRIPTION (FJERNER DUPLISERT TF) ---
+    # Fjern 'tf_map_to_odom_nodes' som forårsaket konflikter/duplisering
+    launch_nodes = [
         sim_time_arg,
         gazebo,
         map_server,
         lifecycle_manager,
+        tf_world_to_map,  # world -> map
         tb3_0,
         tb3_1,
         rviz_node,
         robot1_node,
         robot2_node,
-    ])
+    ]
+    
+    return LaunchDescription(launch_nodes)

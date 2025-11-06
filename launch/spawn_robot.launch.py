@@ -20,11 +20,14 @@ def get_robot_description(context):
     xacro_file_path = os.path.join(get_package_share_directory(package_name_robot), 'urdf', xacro_file_name)
     mesh_dir = os.path.join(get_package_share_directory('turtlebot3_description'),'meshes')
 
+    # Fjerner LaunchConfiguration fra navnet før xacro-prosessen
+    namespace_value = context.launch_configurations['namespace']
+
     robot_description = xacro.process_file(
         xacro_file_path, 
         mappings={
             "mesh_dir": mesh_dir,
-            "namespace": context.launch_configurations['namespace'],
+            "namespace": namespace_value, # Bruk ren verdi her
         },
     ).toxml()
 
@@ -48,6 +51,7 @@ def generate_launch_description():
         'yaw',
         default_value='0.0'
     )
+    # ARGUMENTET FOR use_sim_time MÅ DEKLARERES HER FOR Å KUNNE BRUKES
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time',
         default_value='true',
@@ -59,7 +63,7 @@ def generate_launch_description():
     x = LaunchConfiguration('x')
     y = LaunchConfiguration('y')
     yaw = LaunchConfiguration('yaw')
-    use_sim_time = LaunchConfiguration('use_sim_time')
+    use_sim_time = LaunchConfiguration('use_sim_time') # Leses inn
 
     #Read out robot description from the xacro file and set it as a launch configuration
     robot_description_arg = OpaqueFunction(function=get_robot_description)
@@ -86,17 +90,19 @@ def generate_launch_description():
         arguments=['-topic', 'robot_description',
                     '-entity', namespace,
                     '-robot_namespace', namespace,
-                    # 'reference_frame', 'world',
                     '-x', x, '-y', y, '-Y', yaw],
         output='screen'
     )
     
     # Set a static transformation from the robot's odometry frame to the global map frame
+    # Dette er linjen som fikser A* problemet: map -> <namespace>/odom
     odom_topic = [namespace,'/odom']
     tf_map_to_odom = Node(
         package='tf2_ros', executable='static_transform_publisher',
+        name=[namespace, '_tf_map_to_odom'], # Gi den et unikt navn
         parameters=[{'use_sim_time': use_sim_time}],
         output='screen',
+        # arguments: x, y, z, roll, pitch, yaw, parent_frame, child_frame
         arguments=['0.0', '0.0', '0.0', '0.0', '0.0', '0.0', 'map', odom_topic],
     )
 
@@ -105,12 +111,13 @@ def generate_launch_description():
         PythonLaunchDescriptionSource([os.path.join(get_package_share_directory(package_name_robot), 'launch'), '/aruco_recognition.launch.py']),
         launch_arguments={
             'namespace': namespace,
+            'use_sim_time': use_sim_time, # Send videre sim_time argument
         }.items()
     )
 
     return LaunchDescription([
         namespace_launch_arg,
-        use_sim_time_arg,
+        use_sim_time_arg, # Inkludert i launch description
         robot_description_arg,
         robot_x_pos_arg,
         robot_y_pos_arg,

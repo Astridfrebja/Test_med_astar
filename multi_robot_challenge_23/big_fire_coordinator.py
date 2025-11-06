@@ -104,17 +104,34 @@ class BigFireCoordinator:
             self.memory.set_big_fire_detected_by_other(position)
             
             # Logges KUN FØRSTE GANG
-            self.node.get_logger().info(f'🔥 SUPPORTER: Mottok Big Fire melding fra {scout_id}!')
+            self.node.get_logger().info(
+                f'🔥 SUPPORTER ({self.robot_id}): Mottok Big Fire melding fra {scout_id}! '
+                f'Målposisjon=({position[0]:.2f}, {position[1]:.2f})'
+            )
+            self.node.get_logger().info(
+                f'🚀 SUPPORTER ({self.robot_id}): Fikk beskjed om ild på '
+                f'({position[0]:.2f}, {position[1]:.2f}) – starter navigasjon'
+            )
             self.memory.big_fire_logged = True # Sett flagget etter logging
 
     def robot_at_fire_callback(self, msg: String):
-        """Håndterer meldinger om at annen robot er ved brannen. Logger KUN ved tilstandsskifte."""
-        if msg.data != self.robot_id and "AT_FIRE" in msg.data:
-            if not self.memory.other_robot_at_fire: # Logg kun ved tilstandsskifte
+        """Håndterer meldinger om at annen robot er ved brannen. Logger KUN ved tilstandsskifte.
+
+        Viktig fiks: Ignorer egen melding. Tidligere sammenlignet vi hele strengen med self.robot_id,
+        noe som førte til at lederen kunne tolke sin egen "tb3_0:AT_FIRE" som "annen robot".
+        """
+        if "AT_FIRE" not in msg.data:
+            return
+        # Parse avsender-id før sammenligning
+        try:
+            sender_id = msg.data.split(":")[0]
+        except Exception:
+            return
+        # Bare sett flagg hvis det er en ANNEN robot
+        if sender_id != self.robot_id:
+            if not self.memory.other_robot_at_fire:  # Logg kun ved tilstandsskifte
                 self.memory.set_other_robot_at_fire(True)
-                # Parse ID fra meldingen for renere logg
-                robot_id = msg.data.split(":")[0]
-                self.node.get_logger().info(f'🔥 Annen robot ({robot_id}) er ved brannen!')
+                self.node.get_logger().info(f'🔥 Annen robot ({sender_id}) er ved brannen!')
 
     def fire_extinguished_callback(self, msg: String):
         """Håndterer meldinger om at brannen er slukket. Logger KUN ved tilstandsskifte."""

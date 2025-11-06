@@ -54,7 +54,8 @@ class RobotMemory:
         self.big_fire_detected_by_me = True
         self.big_fire_position = position
         self.my_role = self.LEDER
-        self.big_fire_state = self.LEDER_GOING_TO_FIRE
+        # LEDER skal stoppe og vente umiddelbart, ikke navigere
+        self.big_fire_state = self.LEDER_WAITING
 
     def set_big_fire_detected_by_other(self, position: tuple):
         """Sett Big Fire oppdaget av annen robot"""

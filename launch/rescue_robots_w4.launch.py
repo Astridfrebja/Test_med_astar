@@ -3,7 +3,8 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.actions import DeclareLaunchArgument
+# VIKTIG: Legger til SetLaunchConfiguration
+from launch.actions import DeclareLaunchArgument, SetLaunchConfiguration
 from launch.substitutions import LaunchConfiguration
 
 from launch_ros.actions import Node
@@ -11,57 +12,85 @@ from launch_ros.actions import Node
 def generate_launch_description():
     package_name = 'multi_robot_challenge_23'
 
-    # Get the path to the world, map and rviz configuration file
+    # --- 1. FILSTI-DEFINISJONER (DAT160_W4) ---
     world_file_path = os.path.join(get_package_share_directory(package_name), 'worlds', 'dat160_w4.world')
     map_file_path = os.path.join(get_package_share_directory(package_name), 'maps', 'map_dat160_w4.yaml')
     rviz_config_file_path = os.path.join(get_package_share_directory(package_name), 'rviz', 'model.rviz')
 
-    # Namespace of each robot
-    first_tb3 = 'tb3_0'
-    second_tb3 = 'tb3_1'
-    # Starting position in the gazebo world of each robot
-    first_tb3_pos = ['-0.5', '0.7', '0.0']
-    second_tb3_pos = ['-0.5', '-1.3', '0.0']
-    #Starting orientation in the gazebo world of each robot
-    first_tb3_yaw = '0.0'
-    second_tb3_yaw = '0.0'
+    # --- 2. ROBOTKONFIGURASJON ---
+    robot_namespaces = ['tb3_0', 'tb3_1']
+    # Posisjoner for W4
+    robot_positions = [
+        ['-0.5', '0.7', '0.0'],  # tb3_0
+        ['-0.5', '-1.3', '0.0'], # tb3_1
+    ]
+    robot_yaws = ['0.0', '0.0']
+    
+    # Bakoverkompatibilitet
+    first_tb3 = robot_namespaces[0]
+    second_tb3 = robot_namespaces[1] if len(robot_namespaces) > 1 else None
+    first_tb3_pos = robot_positions[0]
+    second_tb3_pos = robot_positions[1] if len(robot_positions) > 1 else None
+    first_tb3_yaw = robot_yaws[0]
+    second_tb3_yaw = robot_yaws[1] if len(robot_yaws) > 1 else '0.0'
 
-    # Declaring use_sim_time as a launch argument that can then be used in all launch files
+    # --- 3. ARGUMENTER OG GLOBAL KLOKKESETTING ---
+    
+    # Deklarerer argumentet (hvis vi vil overstyre det fra kommandolinjen)
     sim_time_arg = DeclareLaunchArgument(
         'use_sim_time',
         default_value='true',
         description='Use simulation (Gazebo) clock if true'
     )
-    # Get launch argument use_sim_time as a launch configuration object
+    # Leser inn konfigurasjonen
     use_sim_time = LaunchConfiguration('use_sim_time')
 
-    # Starting Gazebo
+    # KRITISK: Setter use_sim_time globalt FØR nodene starter
+    set_sim_time = SetLaunchConfiguration(
+        'use_sim_time', 
+        'true'
+    )
+
+    # --- 4. LANSERING AV HOVEDKOMPONENTER ---
+    
+    # Gazebo
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([os.path.join(get_package_share_directory('gazebo_ros'), 'launch'), '/gazebo.launch.py']),
         launch_arguments={'world': world_file_path}.items()
     )
 
-    # Starting Map Server
+    # Map Server
     map_server = Node(
         package='nav2_map_server',
         executable='map_server',
         name='map_server',
         output='screen',
         parameters=[{"yaml_filename": map_file_path, "topic_name": "map", "frame_id": "map"}],
-        # remappings=remappings
     )
-    # Starting a lifecycle manager that takes care of the map server
+    
+    # Lifecycle Manager
     lifecycle_manager = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
         name='lifecycle_manager_localization',
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time},
+        parameters=[{'use_sim_time': use_sim_time}, # Bruker sim_time
                     {'autostart': True},
                     {'node_names': ["map_server"]}]
     )
 
-    # Spawning the first robot
+    # TF world -> map (Statisk kobling av globalt kart til verdensrammen)
+    tf_world_to_map = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='tf_world_to_map',
+        arguments=['0', '0', '0', '0', '0', '0', 'world', 'map'],
+        output='screen'
+    )
+
+    # --- 5. ROBOTER (Inkluderer spawn_robot.launch.py) ---
+    
+    # Robot 0
     tb3_0 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([os.path.join(get_package_share_directory(package_name), 'launch'), '/spawn_robot.launch.py']),
         launch_arguments={
@@ -69,10 +98,11 @@ def generate_launch_description():
             'x': first_tb3_pos[0],
             'y': first_tb3_pos[1],
             'yaw': first_tb3_yaw,
+            'use_sim_time': use_sim_time, # Sender use_sim_time
         }.items()
     )
 
-    # Spawning the second robot 
+    # Robot 1
     tb3_1 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([os.path.join(get_package_share_directory(package_name), 'launch'), '/spawn_robot.launch.py']),
         launch_arguments={
@@ -80,26 +110,28 @@ def generate_launch_description():
             'x': second_tb3_pos[0],
             'y': second_tb3_pos[1],
             'yaw': second_tb3_yaw,
+            'use_sim_time': use_sim_time, # Sender use_sim_time
         }.items()
     )
 
-    # Starting rviz
+    # RViz
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
         name='rviz2',
         arguments=['-d', rviz_config_file_path],
-        parameters=[{'use_sim_time': use_sim_time}],
+        parameters=[{'use_sim_time': use_sim_time}], # Bruker sim_time
         output='screen'
     )
 
+    # Robot Kontroller-Noder
     robot1_node = Node(
         package=package_name,
         executable='robot_node',
         name='robot_controller_tb3_0',
         namespace=first_tb3,
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time}]
+        parameters=[{'use_sim_time': use_sim_time}] # Bruker sim_time
     )
     
     robot2_node = Node(
@@ -108,17 +140,24 @@ def generate_launch_description():
         name='robot_controller_tb3_1',
         namespace=second_tb3,
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time}]
+        parameters=[{'use_sim_time': use_sim_time}] # Bruker sim_time
     )
 
-    return LaunchDescription([
-        sim_time_arg,
+    # --- 6. BYGG LAUNCH DESCRIPTION ---
+    
+    launch_nodes = [
+        set_sim_time,   # KRITISK: Setter global klokke først
+        sim_time_arg,   # Deklarasjon av argumentet
         gazebo,
         map_server,
         lifecycle_manager,
+        tf_world_to_map, 
         tb3_0,
         tb3_1,
         rviz_node,
         robot1_node,
         robot2_node,
-    ])
+        # TF-koblingen map -> <namespace>/odom håndteres NÅ KUN av spawn_robot.launch.py
+    ]
+    
+    return LaunchDescription(launch_nodes)
