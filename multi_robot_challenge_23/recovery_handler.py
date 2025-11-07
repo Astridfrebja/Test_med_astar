@@ -17,7 +17,7 @@ class RecoveryHandler:
     Single Responsibility: Kun stuck detection og recovery
     """
     
-    STUCK_TIME_SEC = 2.0  # hvor lenge uten fremdrift før recovery
+    STUCK_TIME_SEC = 3.0  # hvor lenge uten fremdrift før recovery
     STUCK_PROGRESS_EPS = 0.10  # meter forbedring som teller som fremdrift
     TURN_SPEED = 0.5
     
@@ -50,6 +50,12 @@ class RecoveryHandler:
             bool: True hvis recovery skal utføres
         """
         if self.last_progress_time == 0.0:
+            self.last_progress_time = current_time
+            self.last_progress_dist = distance_to_goal
+            return False
+        
+        # Ikke start recovery når vi allerede er svært nær målet
+        if distance_to_goal <= 0.6:
             self.last_progress_time = current_time
             self.last_progress_dist = distance_to_goal
             return False

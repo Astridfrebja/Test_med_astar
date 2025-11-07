@@ -59,10 +59,11 @@ class AStarPathfinder:
         self.node.get_logger().debug(f'⭐ A* søk: start={start}, goal={goal}, map_size={max_x}x{max_y}')
         
         iterations = 0
-        # Beregn maks iterations basert på avstand (sikkerhetsmargin)
+        # Beregn maks iterations basert på avstand
+        # Redusert fra 500x til 150x for å unngå unødvendig lange søk
         estimated_distance = self.distance(start, goal)
-        max_iterations = int(estimated_distance * 50)  # 50x avstand som sikkerhetsmargin
-        max_iterations = max(50000, min(max_iterations, 200000))  # Min 50k, max 200k
+        max_iterations = max(10000, min(int(estimated_distance * 150), 150000))  # Min 10k, max 150k
+        self.node.get_logger().info(f'⭐ A*: Starter søk fra {start} til {goal}. Max iterations: {max_iterations}')
         
         while open_set:
             iterations += 1
@@ -70,20 +71,31 @@ class AStarPathfinder:
                 self.node.get_logger().warn(f'⭐ A*: Max iterations ({max_iterations}) nådd, avbryter søk')
                 break
             
-            # Sjekk om open_set er tom (skal ikke skje siden vi sjekker i while)
-            if len(open_set) == 0:
-                self.node.get_logger().warn('⭐ A*: Open set er tom - ingen rute funnet')
+            # Pop node fra heap - hopp over duplikater som allerede er prosessert
+            current = None
+            while open_set:
+                _, _, candidate = heapq.heappop(open_set)
+                # Hvis noden ikke er i closed_set og er i open_set_dict, prosesser den
+                if candidate not in closed_set and candidate in open_set_dict:
+                    current = candidate
+                    break
+                # Hvis noden allerede er prosessert (duplikat i heap), hopp over
+                # og fortsett til neste node
+            
+            if current is None:
+                # open_set er tom eller alle noder er allerede prosessert - ingen rute funnet
+                self.node.get_logger().warn('⭐ A*: Open set er tom eller alle noder prosessert - ingen rute funnet')
                 break
-                
-            _, _, current = heapq.heappop(open_set)
             
             # Fjern fra open_set tracking
-            if current in open_set_dict:
-                open_set_dict.remove(current)
+            open_set_dict.remove(current)
             
-            # Sjekk om vi har nådd målet - mer fleksibel sjekk
+            # Legg til i closed_set FØR vi prosesserer
+            closed_set.add(current)
+            
+            # Sjekk om vi har nådd målet - mer presis sjekk
             dist_to_goal = self.distance(current, goal)
-            if dist_to_goal < 3.0:  # Økt fra 2.0 for å tillate nærliggende celler nær vegger
+            if dist_to_goal <= 1.5:  # Tillat nærliggende celler (1.5 grid cells)
                 # Rekonstruer path
                 path = self.reconstruct_path(came_from, current)
                 # Legg til goal hvis ikke allerede inkludert
@@ -91,11 +103,6 @@ class AStarPathfinder:
                     path.append(goal)
                 self.node.get_logger().info(f'⭐ A* fant rute med {len(path)} steg (distance til goal: {dist_to_goal:.2f})')
                 return path
-            
-            if current in closed_set:
-                continue
-            
-            closed_set.add(current)
             
             # Utforsk naboer (8-retnings bevegelse)
             neighbors = self.get_neighbors(current, max_x, max_y)
@@ -127,27 +134,68 @@ class AStarPathfinder:
                 if neighbor in closed_set:
                     continue
                 
-                # Beregn tentativ g_score
-                tentative_g = g_score[current] + self.distance(current, neighbor)
+                # Corner detection - forhindre å kutte hjørner gjennom vegger
+                # Hvis vi beveger oss diagonalt, sjekk at begge nabo-celler er traversable
+                dx = neighbor[0] - current[0]
+                dy = neighbor[1] - current[1]
                 
-                # Beregn f_score for neighbor
-                f_new = tentative_g + self.heuristic(neighbor, goal)
+                # Hvis diagonal bevegelse, sjekk hjørner
+                if abs(dx) == 1 and abs(dy) == 1:
+                    # Sjekk at begge nabo-celler er traversable (forhindrer å kutte hjørner)
+                    corner1 = (current[0] + dx, current[1])  # Kardinal nabo 1
+                    corner2 = (current[0], current[1] + dy)    # Kardinal nabo 2
+                    
+                    # Sjekk bounds først
+                    if (0 <= corner1[0] < max_x and 0 <= corner1[1] < max_y and
+                        0 <= corner2[0] < max_x and 0 <= corner2[1] < max_y):
+                        # Hvis en av nabo-cellene er en hindring, kan vi ikke gå diagonalt
+                        if not self.is_traversable(corner1[0], corner1[1]) or \
+                           not self.is_traversable(corner2[0], corner2[1]):
+                            continue  # Hopp over denne diagonal bevegelsen
                 
-                # Hvis neighbor ikke er i open_set eller vi har funnet en bedre rute
+                # Beregn kostnad (g_score) - bruk diagonal distance for diagonal bevegelse
+                if abs(dx) == 1 and abs(dy) == 1:
+                    # Diagonal bevegelse - kostnad sqrt(2) ≈ 1.414
+                    move_cost = 1.414
+                else:
+                    # Kardinal bevegelse - kostnad 1.0
+                    move_cost = 1.0
+                
+                tentative_g = g_score.get(current, float('inf')) + move_cost
+                
+                # Sjekk om vi har funnet en bedre rute til denne noden
+                if neighbor in open_set_dict:
+                    # Node er allerede i open_set - sjekk om ny rute er bedre
+                    if tentative_g >= g_score.get(neighbor, float('inf')):
+                        continue  # Ny rute er ikke bedre, hopp over
+                    # Ny rute er bedre - oppdater (gamle entry i heap vil bli ignorert når den poppes)
+                
+                # Oppdater came_from, g_score
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                
+                # Heuristikk (må være admissible - aldri overestimere)
+                # Bruker Euclidean distance (admissible for 8-retnings bevegelse)
+                h = self.heuristic(neighbor, goal)
+                
+                # Tie-breaking: Legg til en liten verdi basert på avstand til mål
+                # Dette favoriserer noder nærmere målet når f_score er lik
+                # Bruker en liten epsilon (0.001) for å unngå å bryte admissibility
+                # Men hjelper med å unngå sirkulær utforskning
+                tie_breaker = h * 0.001
+                f_new = tentative_g + h + tie_breaker
+                
+                # Oppdater f_score
+                f_score[neighbor] = f_new
+                
                 if neighbor not in open_set_dict:
-                    # Ny node - legg til
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g
-                    f_score[neighbor] = f_new
+                    # Ny node - legg til i open_set
                     open_set_dict.add(neighbor)
                     counter += 1
                     heapq.heappush(open_set, (f_new, counter, neighbor))
-                elif tentative_g < g_score.get(neighbor, float('inf')):
-                    # Bedre rute funnet - oppdater
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g
-                    f_score[neighbor] = f_new
-                    # Legg til igjen med ny score (heapq vil håndtere dette)
+                else:
+                    # Bedre rute funnet - legg til ny entry i heap
+                    # Den gamle, dårligere verdien vil bli ignorert når den poppes (sjekket i while loop)
                     counter += 1
                     heapq.heappush(open_set, (f_new, counter, neighbor))
         

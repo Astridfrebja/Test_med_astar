@@ -51,6 +51,8 @@ class AStarNavigator:
         # Visualization counter for periodic updates
         self.viz_counter = 0
         self.last_plan_time = 0.0
+        self.planning_in_progress = False  # Flag for å unngå samtidig planlegging
+        self.initial_plan_done = False  # Flag for å unngå replan umiddelbart etter første planlegging
         
         # Setup publisher
         self.cmd_vel_publisher = self.node.create_publisher(Twist, 'cmd_vel', 10)
@@ -84,18 +86,28 @@ class AStarNavigator:
         self.target_position = position
         self.navigation_active = True
         
-        # Planlegg rute med A*
-        success = self.plan_path()
-        
-        if success:
-            self.node.get_logger().info(f'⭐ A* ({self.robot_id}): Rute planlagt til {position} med {len(self.path)} waypoints')
-            self.viz_counter = 0  # Reset counter for umiddelbar visualisering
-            self.path_visualizer.publish(self.path)
+        # Planlegg rute med A* (blokkerer ikke - navigasjon kan starte mens planlegging pågår)
+        if not self.planning_in_progress:
+            self.planning_in_progress = True
+            success = self.plan_path()
+            self.planning_in_progress = False
+            
+            # Oppdater last_plan_time for å unngå umiddelbar replan
+            now_sec = self.node.get_clock().now().nanoseconds / 1e9
+            self.last_plan_time = now_sec
+            
+            if success:
+                self.initial_plan_done = True  # Marker at første planlegging er ferdig
+                self.node.get_logger().info(f'⭐ A* ({self.robot_id}): Rute planlagt til {position} med {len(self.path)} waypoints')
+                self.viz_counter = 0  # Reset counter for umiddelbar visualisering
+                self.path_visualizer.publish(self.path)
+            else:
+                self.node.get_logger().warn(f'⭐ A* ({self.robot_id}): Kunne ikke finne rute til {position}')
+                # Publiser tom path for å fjerne gamle markers
+                self.path_visualizer.publish([])
+                # Ikke deaktiver navigasjon - prøv igjen ved neste replan
         else:
-            self.node.get_logger().warn(f'⭐ A* ({self.robot_id}): Kunne ikke finne rute til {position}')
-            # Publiser tom path for å fjerne gamle markers
-            self.path_visualizer.publish([])
-            self.navigation_active = False
+            self.node.get_logger().debug('⭐ A*: Planlegging pågår allerede, hopper over')
     
     def clear_goal(self):
         """Fjern aktivt mål og rute"""
@@ -103,6 +115,7 @@ class AStarNavigator:
         self.path = []
         self.current_waypoint_idx = 0
         self.navigation_active = False
+        self.initial_plan_done = False  # Reset flag
         self.path_visualizer.publish([])
         self.stop_robot()
     
@@ -163,12 +176,14 @@ class AStarNavigator:
         
         # Viktig: Sjekk at start er traversable
         if not start_traversable:
-            self.node.get_logger().error(
+            self.node.get_logger().warn(
                 f'⭐ A*: START er ikke traversable! occ={start_occupancy}, '
-                f'start_map={start_map}, start_world={self.robot_position}'
+                f'start_map={start_map}, start_world={self.robot_position}. '
+                f'Dette kan skje hvis roboten er manuelt flyttet til en hindring. '
+                f'Prøver å finne nærmeste traversable punkt...'
             )
             # Prøv å finne nærmeste traversable punkt til start
-            adjusted_start = self.path_planner.find_nearest_traversable(start_map, max_search_radius=5)
+            adjusted_start = self.path_planner.find_nearest_traversable(start_map, max_search_radius=10)
             if adjusted_start:
                 start_map = adjusted_start
                 self.node.get_logger().warn(f'⭐ A*: Justert start til {start_map}')
@@ -176,56 +191,55 @@ class AStarNavigator:
                 self.node.get_logger().error('⭐ A*: Kunne ikke finne traversable start!')
                 return False
         
-        # Hvis målet er på en hindring, finn nærmeste traversable punkt
-        if not goal_traversable:
-            self.node.get_logger().warn(f'⭐ A*: Målet er på en hindring! Søker etter nærmeste traversable punkt...')
+        # Alltid prøv å bruke lederens posisjon hvis tilgjengelig (for Big Fire scenario)
+        # Dette sikrer at supporteren navigerer til riktig side av veggen
+        leader_pos = None
+        if self.leader_position_callback:
+            try:
+                leader_pos = self.leader_position_callback()
+            except Exception as e:
+                self.node.get_logger().debug(f'⭐ A*: Kunne ikke hente lederens posisjon: {e}')
+        
+        # Hvis lederens posisjon er tilgjengelig, bruk den i stedet for ArUco merket
+        if leader_pos:
+            leader_map = self.occupancy_grid_manager.world_to_map(leader_pos[0], leader_pos[1])
+            leader_traversable = self.path_planner.is_traversable(leader_map[0], leader_map[1])
             
-            # Først: Prøv å bruke lederens posisjon hvis tilgjengelig (for Big Fire scenario)
-            leader_pos = None
-            if self.leader_position_callback:
-                try:
-                    leader_pos = self.leader_position_callback()
-                except Exception as e:
-                    self.node.get_logger().debug(f'⭐ A*: Kunne ikke hente lederens posisjon: {e}')
-            
-            if leader_pos:
-                # Lederen er ved brannen - bruk lederens posisjon direkte som mål
-                # i stedet for ArUco merket sin posisjon (som er på veggen)
-                leader_map = self.occupancy_grid_manager.world_to_map(leader_pos[0], leader_pos[1])
-                leader_traversable = self.path_planner.is_traversable(leader_map[0], leader_map[1])
-                
-                if leader_traversable:
-                    # Lederens posisjon er traversable - bruk den direkte
-                    goal_map = leader_map
-                    self.target_position = leader_pos
-                    self.node.get_logger().info(f'⭐ A*: Bruker lederens posisjon direkte (ikke ArUco merket): map={goal_map}, world={self.target_position}')
-                else:
-                    # Lederens posisjon er ikke traversable - finn nærmeste traversable punkt
-                    adjusted_goal = self.path_planner.find_nearest_traversable_towards_goal(start_map, leader_map, max_search_radius=15)
-                    if adjusted_goal:
-                        goal_map = adjusted_goal
-                        self.target_position = self.occupancy_grid_manager.map_to_world(goal_map[0], goal_map[1])
-                        self.node.get_logger().info(f'⭐ A*: Bruker punkt nær lederen (riktig side av veggen): map={goal_map}, world={self.target_position}')
-                    else:
-                        # Fallback: prøv vanlig søk
-                        adjusted_goal = self.path_planner.find_nearest_traversable(leader_map, max_search_radius=10)
-                        if adjusted_goal:
-                            goal_map = adjusted_goal
-                            self.target_position = self.occupancy_grid_manager.map_to_world(goal_map[0], goal_map[1])
-                            self.node.get_logger().warn(f'⭐ A*: Fallback - bruker punkt nær lederen: map={goal_map}, world={self.target_position}')
-                        else:
-                            self.node.get_logger().error('⭐ A*: Kunne ikke finne traversable punkt nær lederen!')
-                            return False
+            if leader_traversable:
+                # Lederens posisjon er traversable - bruk den direkte
+                goal_map = leader_map
+                self.target_position = leader_pos
+                self.node.get_logger().info(f'⭐ A*: Bruker lederens posisjon direkte (ikke ArUco merket): map={goal_map}, world={self.target_position}')
             else:
-                # Ingen leder-posisjon tilgjengelig: finn nærmeste traversable punkt i retning fra roboten til målet
-                adjusted_goal = self.path_planner.find_nearest_traversable_towards_goal(start_map, goal_map, max_search_radius=15)
+                # Lederens posisjon er ikke traversable - finn nærmeste traversable punkt
+                adjusted_goal = self.path_planner.find_nearest_traversable_towards_goal(start_map, leader_map, max_search_radius=20)
                 if adjusted_goal:
                     goal_map = adjusted_goal
                     self.target_position = self.occupancy_grid_manager.map_to_world(goal_map[0], goal_map[1])
-                    self.node.get_logger().info(f'⭐ A*: Justert mål til traversable punkt i retning: map={goal_map}, world={self.target_position}')
+                    self.node.get_logger().info(f'⭐ A*: Bruker punkt nær lederen (riktig side av veggen): map={goal_map}, world={self.target_position}')
                 else:
-                    self.node.get_logger().error('⭐ A*: Kunne ikke finne traversable punkt!')
-                    return False
+                    # Fallback: prøv vanlig søk
+                    adjusted_goal = self.path_planner.find_nearest_traversable(leader_map, max_search_radius=15)
+                    if adjusted_goal:
+                        goal_map = adjusted_goal
+                        self.target_position = self.occupancy_grid_manager.map_to_world(goal_map[0], goal_map[1])
+                        self.node.get_logger().warn(f'⭐ A*: Fallback - bruker punkt nær lederen: map={goal_map}, world={self.target_position}')
+                    else:
+                        self.node.get_logger().error('⭐ A*: Kunne ikke finne traversable punkt nær lederen!')
+                        return False
+        
+        # Hvis målet er på en hindring (og vi ikke har lederens posisjon), finn nærmeste traversable punkt
+        elif not goal_traversable:
+            self.node.get_logger().warn(f'⭐ A*: Målet er på en hindring! Søker etter nærmeste traversable punkt...')
+            # Ingen leder-posisjon tilgjengelig: finn nærmeste traversable punkt i retning fra roboten til målet
+            adjusted_goal = self.path_planner.find_nearest_traversable_towards_goal(start_map, goal_map, max_search_radius=20)
+            if adjusted_goal:
+                goal_map = adjusted_goal
+                self.target_position = self.occupancy_grid_manager.map_to_world(goal_map[0], goal_map[1])
+                self.node.get_logger().info(f'⭐ A*: Justert mål til traversable punkt i retning: map={goal_map}, world={self.target_position}')
+            else:
+                self.node.get_logger().error('⭐ A*: Kunne ikke finne traversable punkt!')
+                return False
         
         # Kjør A* algoritmen
         self.node.get_logger().info(f'⭐ A*: Starter søk fra {start_map} til {goal_map}')
@@ -242,13 +256,50 @@ class AStarNavigator:
         self.path = self.path_planner.smooth_path(path_map)
         self.current_waypoint_idx = 0
         
-        # Logg at path er satt
-        self.node.get_logger().info(
-            f'⭐ A*: Path satt! path_len={len(self.path)}, '
-            f'first_waypoint={self.path[0] if self.path else None}, '
-            f'last_waypoint={self.path[-1] if self.path else None}, '
-            f'robot_pos={self.robot_position}'
-        )
+        # DEBUG: Verifiser at path koordinater er riktige
+        if self.path:
+            # Sjekk første og siste waypoint
+            first_wp = self.path[0]
+            last_wp = self.path[-1]
+            
+            # Konverter tilbake til map for å verifisere
+            first_map_check = self.occupancy_grid_manager.world_to_map(first_wp[0], first_wp[1])
+            last_map_check = self.occupancy_grid_manager.world_to_map(last_wp[0], last_wp[1])
+            
+            # Sjekk om første waypoint er nær start
+            dist_to_start = math.sqrt(
+                (first_wp[0] - self.robot_position[0])**2 + 
+                (first_wp[1] - self.robot_position[1])**2
+            )
+            
+            # Sjekk om siste waypoint er nær mål
+            dist_to_goal = math.sqrt(
+                (last_wp[0] - self.target_position[0])**2 + 
+                (last_wp[1] - self.target_position[1])**2
+            )
+            
+            self.node.get_logger().info(
+                f'⭐ A*: Path satt! path_len={len(self.path)}, '
+                f'first_waypoint_world={first_wp}, first_waypoint_map={first_map_check}, '
+                f'last_waypoint_world={last_wp}, last_waypoint_map={last_map_check}, '
+                f'dist_to_start={dist_to_start:.2f}m, dist_to_goal={dist_to_goal:.2f}m, '
+                f'robot_pos={self.robot_position}, target={self.target_position}'
+            )
+            
+            # Sjekk om noen waypoints er på hindringer
+            obstacles_in_path = 0
+            for wp in self.path[::max(1, len(self.path)//10)]:  # Sjekk hver 10. waypoint
+                wp_map = self.occupancy_grid_manager.world_to_map(wp[0], wp[1])
+                if not self.path_planner.is_traversable(wp_map[0], wp_map[1]):
+                    obstacles_in_path += 1
+            
+            if obstacles_in_path > 0:
+                self.node.get_logger().warn(
+                    f'⭐ A*: ADVARSEL! {obstacles_in_path} waypoints i path er på hindringer! '
+                    f'Dette kan tyde på koordinatfeil.'
+                )
+        else:
+            self.node.get_logger().warn('⭐ A*: Path er tom etter smoothing!')
         
         return True
     
@@ -275,15 +326,46 @@ class AStarNavigator:
             self.path_visualizer.publish(self.path)
             self.visited_tracker.publish()
         
-        # Periodisk replan
+        # Periodisk replan (kun hvis ikke allerede planlegger og vi har en path)
         now_sec = self.node.get_clock().now().nanoseconds / 1e9
-        if (now_sec - self.last_plan_time) >= self.REPLAN_INTERVAL_SEC:
-            if self.target_position is not None:
-                planned = self.plan_path()
-                self.last_plan_time = now_sec
-                if not planned:
-                    # Ingen path: la koordinatoren falle tilbake til Bug2
-                    self.path = []
+        
+        # Beregn avstand til mål for å avgjøre om vi skal replan
+        distance_to_goal = math.sqrt(
+            (self.target_position[0] - self.robot_position[0])**2 +
+            (self.target_position[1] - self.robot_position[1])**2
+        ) if self.target_position else float('inf')
+        
+        # Sjekk om vi har nådd endelig mål FØR replan-sjekk
+        if distance_to_goal <= PathFollower.GOAL_THRESHOLD:
+            self.node.get_logger().info('⭐ ENDELIG MÅL NÅDD!')
+            self.stop_robot()
+            return True
+        
+        # Kun replan hvis:
+        # 1. Første planlegging er ferdig (initial_plan_done)
+        # 2. Det har gått nok tid siden siste planlegging (REPLAN_INTERVAL_SEC)
+        # 3. Vi har en path
+        # 4. Vi ikke allerede planlegger
+        # 5. Vi har et mål
+        # 6. Roboten er fortsatt langt unna målet (ikke replan hvis vi er nærme eller har nådd målet)
+        time_since_last_plan = now_sec - self.last_plan_time
+        should_replan = (
+            self.initial_plan_done and
+            time_since_last_plan >= self.REPLAN_INTERVAL_SEC and 
+            self.target_position is not None and 
+            not self.planning_in_progress and 
+            self.path and
+            distance_to_goal > PathFollower.GOAL_THRESHOLD * 2  # Ikke replan hvis vi er nærme målet
+        )
+        
+        if should_replan:
+            self.planning_in_progress = True
+            planned = self.plan_path()
+            self.planning_in_progress = False
+            self.last_plan_time = now_sec
+            if not planned:
+                # Ingen path: la koordinatoren falle tilbake til Bug2
+                self.path = []
         
         if not self.path:
             # Logg sjeldent for å indikere at path er tom (mulig fallback)
@@ -298,12 +380,8 @@ class AStarNavigator:
                 self._last_empty_path_log = now_sec
             return False
         
+        # Avstand til mål er allerede beregnet over (i replan-seksjonen)
         # Sjekk om vi har nådd endelig mål
-        distance_to_goal = math.sqrt(
-            (self.target_position[0] - self.robot_position[0])**2 +
-            (self.target_position[1] - self.robot_position[1])**2
-        )
-        
         if distance_to_goal <= PathFollower.GOAL_THRESHOLD:
             self.node.get_logger().info('⭐ ENDELIG MÅL NÅDD!')
             self.stop_robot()
@@ -389,4 +467,3 @@ class AStarNavigator:
     def stop_robot(self):
         """Stopp roboten"""
         self.path_follower.stop_robot()
-

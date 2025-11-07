@@ -26,8 +26,8 @@ class PathFollower:
     WAYPOINT_THRESHOLD = 0.3  # meters til waypoint er nådd
     GOAL_THRESHOLD = 0.5  # meters til endelig mål er nådd
     P_GAIN = 1.5  # P-kontroll for heading
-    OBSTACLE_THRESHOLD = 0.4  # meter til hindring
-    BLOCKED_LIMIT = 15  # antall påfølgende sykluser med blokkert front før fallback
+    OBSTACLE_THRESHOLD = 0.25  # meter til hindring
+    BLOCKED_LIMIT = 60  # antall påfølgende sykluser med blokkert front før fallback
     
     def __init__(self, node: Node, sensor_manager=None, cmd_vel_publisher=None):
         """

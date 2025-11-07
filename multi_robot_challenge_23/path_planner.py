@@ -18,7 +18,7 @@ class PathPlanner:
     Single Responsibility: Kun path planning logikk
     """
     
-    INFLATION_RADIUS = 1  # Grid cells å inflere rundt hindringer
+    INFLATION_RADIUS = 0  # Grid cells å inflere rundt hindringer (0 = kun sjekk selve cellen)
     
     def __init__(self, node: Node, occupancy_grid_manager, leader_position_callback=None):
         """
@@ -34,6 +34,7 @@ class PathPlanner:
     def is_traversable(self, map_x: int, map_y: int) -> bool:
         """
         Sjekk om en map celle er traverserbar (ikke hindring)
+        Bruker en liten mask (3x3) for å fjerne støy og gjøre traversability check mer robust
         
         Args:
             map_x, map_y: Map koordinater
@@ -46,32 +47,43 @@ class PathPlanner:
         if map_x < 0 or map_x >= map_info['height'] or map_y < 0 or map_y >= map_info['width']:
             return False
         
-        # Sjekk om selve cellen er fri eller unknown (unknown behandles som traversable)
-        occupancy = self.occupancy_grid_manager.get_occupancy_value(map_x, map_y)
-        if occupancy == -1:
-            # Unknown område - behandles som traversable
-            return True
-        if occupancy > 50:  # Obstacle threshold
+        # Bruk en liten mask (3x3) for å fjerne støy i map data
+        # Dette ligner på MapFilterClass, men vi gjør det "on-the-fly" uten å lagre et nytt map
+        mask_size = 3
+        mask_radius = mask_size // 2  # 1 for 3x3 mask
+        
+        occupancy_sum = 0
+        valid_cells = 0
+        
+        # Gå gjennom masken
+        for dx in range(-mask_radius, mask_radius + 1):
+            for dy in range(-mask_radius, mask_radius + 1):
+                check_x = map_x + dx
+                check_y = map_y + dy
+                
+                # Sjekk bounds
+                if check_x < 0 or check_x >= map_info['height'] or check_y < 0 or check_y >= map_info['width']:
+                    continue
+                
+                occupancy = self.occupancy_grid_manager.get_occupancy_value(check_x, check_y)
+                
+                # Ignorer unknown celler i gjennomsnittet (de teller ikke med)
+                if occupancy == -1:
+                    continue
+                
+                occupancy_sum += occupancy
+                valid_cells += 1
+        
+        # Hvis ingen gyldige celler (alle unknown), behandles som ikke traversable
+        if valid_cells == 0:
             return False
         
-        # Sjekk inflated område rundt (for robot safety margin)
-        if self.INFLATION_RADIUS > 0:
-            for dx in range(-self.INFLATION_RADIUS, self.INFLATION_RADIUS + 1):
-                for dy in range(-self.INFLATION_RADIUS, self.INFLATION_RADIUS + 1):
-                    if dx == 0 and dy == 0:
-                        continue
-                    
-                    check_x = map_x + dx
-                    check_y = map_y + dy
-                    
-                    # Sjekk bounds først
-                    if check_x < 0 or check_x >= map_info['height'] or check_y < 0 or check_y >= map_info['width']:
-                        continue
-                    
-                    # Hvis det er en hindring i nærheten, marker som ikke traverserbar
-                    check_occupancy = self.occupancy_grid_manager.get_occupancy_value(check_x, check_y)
-                    if check_occupancy > 50:  # Obstacle threshold
-                        return False
+        # Beregn gjennomsnittlig occupancy i masken
+        avg_occupancy = occupancy_sum / valid_cells
+        
+        # Hvis gjennomsnitt >= 50, er det en hindring
+        if avg_occupancy >= 50:
+            return False
         
         return True
     
