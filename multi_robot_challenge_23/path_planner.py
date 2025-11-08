@@ -18,7 +18,7 @@ class PathPlanner:
     Single Responsibility: Kun path planning logikk
     """
     
-    INFLATION_RADIUS = 0  # Grid cells å inflere rundt hindringer (0 = kun sjekk selve cellen)
+    INFLATION_RADIUS = 1  # Grid cells å inflere rundt hindringer
     
     def __init__(self, node: Node, occupancy_grid_manager, leader_position_callback=None):
         """
@@ -47,44 +47,16 @@ class PathPlanner:
         if map_x < 0 or map_x >= map_info['height'] or map_y < 0 or map_y >= map_info['width']:
             return False
         
-        # Bruk en liten mask (3x3) for å fjerne støy i map data
-        # Dette ligner på MapFilterClass, men vi gjør det "on-the-fly" uten å lagre et nytt map
-        mask_size = 3
-        mask_radius = mask_size // 2  # 1 for 3x3 mask
-        
-        occupancy_sum = 0
-        valid_cells = 0
-        
-        # Gå gjennom masken
+        mask_radius = self.INFLATION_RADIUS
         for dx in range(-mask_radius, mask_radius + 1):
             for dy in range(-mask_radius, mask_radius + 1):
                 check_x = map_x + dx
                 check_y = map_y + dy
-                
-                # Sjekk bounds
                 if check_x < 0 or check_x >= map_info['height'] or check_y < 0 or check_y >= map_info['width']:
                     continue
-                
-                occupancy = self.occupancy_grid_manager.get_occupancy_value(check_x, check_y)
-                
-                # Ignorer unknown celler i gjennomsnittet (de teller ikke med)
-                if occupancy == -1:
-                    continue
-                
-                occupancy_sum += occupancy
-                valid_cells += 1
-        
-        # Hvis ingen gyldige celler (alle unknown), behandles som ikke traversable
-        if valid_cells == 0:
-            return False
-        
-        # Beregn gjennomsnittlig occupancy i masken
-        avg_occupancy = occupancy_sum / valid_cells
-        
-        # Hvis gjennomsnitt >= 50, er det en hindring
-        if avg_occupancy >= 50:
-            return False
-        
+                occ = self.occupancy_grid_manager.get_occupancy_value(check_x, check_y)
+                if occ == 100:
+                    return False
         return True
     
     def get_neighbors(self, node: tuple, max_x: int, max_y: int) -> list:

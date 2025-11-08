@@ -220,7 +220,7 @@ class AStarPathfinder:
             if best_dist > 10.0:
                 self.node.get_logger().warn(
                     f'⭐ A*: Nærmeste traversable node er for langt fra goal ({best_dist:.1f} > 10), '
-                    f'returnerer tom path for fallback til Bug2'
+                    'returnerer tom path for alternativ strategi'
                 )
                 return []
             # Returner path til nærmeste traversable node

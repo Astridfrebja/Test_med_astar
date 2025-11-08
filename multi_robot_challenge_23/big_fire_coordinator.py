@@ -72,20 +72,13 @@ class BigFireCoordinator:
 
     def detect_big_fire(self, position: tuple):
         """Leder oppdager Big Fire"""
-        
-        is_new_detection = not self.memory.big_fire_logged
-        
-        if is_new_detection:
-            # Setter state KUN hvis den er ny
-            self.memory.set_big_fire_detected_by_me(position)
-            
-            # Publisering sendes kun ved ny deteksjon
-            self.publish_big_fire_detection(position) 
-            
-            self.node.get_logger().info(f'🔥 LEDER: Big Fire oppdaget på {position}!')
-            self.node.get_logger().info('🔥 LEDER: Roboten skal nå stoppe og vente på koordinering!')
-            
-            self.memory.big_fire_logged = True
+        if self.memory.big_fire_state != self.memory.NORMAL:
+            return
+
+        self.memory.set_big_fire_detected_by_me(position)
+        self.publish_big_fire_detection(position)
+        self.node.get_logger().info(f'Leder registrerte big fire ved ({position[0]:.2f}, {position[1]:.2f})')
+
     def big_fire_callback(self, msg: String):
         """Supporter mottar Big Fire melding fra Leder. Logger KUN første gangen per hendelse."""
         if "BIG_FIRE_DETECTED" in msg.data:
@@ -96,23 +89,13 @@ class BigFireCoordinator:
             position = (float(parts[1]), float(parts[2]))
             scout_id = parts[3] if len(parts) > 3 else "unknown"
 
-            if self.memory.big_fire_logged:
-                # Allerede logget denne hendelsen som supporter, ikke logg igjen
+            if self.memory.big_fire_state != self.memory.NORMAL:
                 return
-            
-            # Sett tilstand og rolle i minnet
+
             self.memory.set_big_fire_detected_by_other(position)
-            
-            # Logges KUN FØRSTE GANG
             self.node.get_logger().info(
-                f'🔥 SUPPORTER ({self.robot_id}): Mottok Big Fire melding fra {scout_id}! '
-                f'Målposisjon=({position[0]:.2f}, {position[1]:.2f})'
+                f'Supporter {self.robot_id} mottok big fire fra {scout_id} ved ({position[0]:.2f}, {position[1]:.2f})'
             )
-            self.node.get_logger().info(
-                f'🚀 SUPPORTER ({self.robot_id}): Fikk beskjed om ild på '
-                f'({position[0]:.2f}, {position[1]:.2f}) – starter navigasjon'
-            )
-            self.memory.big_fire_logged = True # Sett flagget etter logging
 
     def robot_at_fire_callback(self, msg: String):
         """Håndterer meldinger om at annen robot er ved brannen. Logger KUN ved tilstandsskifte.
@@ -129,16 +112,26 @@ class BigFireCoordinator:
             return
         # Bare sett flagg hvis det er en ANNEN robot
         if sender_id != self.robot_id:
-            if not self.memory.other_robot_at_fire:  # Logg kun ved tilstandsskifte
+            parts = msg.data.split(":")
+            if len(parts) >= 4:
+                try:
+                    x = float(parts[2])
+                    y = float(parts[3])
+                    self.memory.big_fire_position = (x, y)
+                    self.node.get_logger().info(
+                        f'Robot {sender_id} er ved brannen, pos=({x:.2f}, {y:.2f})'
+                    )
+                except ValueError:
+                    self.node.get_logger().debug(f'Kunne ikke tolke AT_FIRE posisjon fra "{msg.data}"')
+            if not self.memory.other_robot_at_fire:
                 self.memory.set_other_robot_at_fire(True)
-                self.node.get_logger().info(f'🔥 Annen robot ({sender_id}) er ved brannen!')
 
     def fire_extinguished_callback(self, msg: String):
         """Håndterer meldinger om at brannen er slukket. Logger KUN ved tilstandsskifte."""
         if "FIRE_EXTINGUISHED" in msg.data:
-            if not self.memory.fire_extinguished: # Logg kun ved tilstandsskifte
+            if not self.memory.fire_extinguished:
                 self.memory.set_fire_extinguished(True)
-                self.node.get_logger().info('🔥 BRANNEN ER SLUKKET!')
+                self.node.get_logger().info('Brannmelding mottatt: slukket')
 
     def update_state(self, robot_position: tuple, robot_orientation: float):
         """Oppdater Big Fire tilstand basert på posisjon"""
@@ -171,40 +164,32 @@ class BigFireCoordinator:
         """Sjekk om Leder venter på Supporter"""
         return self.memory.is_leder_waiting()
 
-    def log_waiting_state(self):
-        """Egen loggfunksjon for 'vente' tilstanden for å unngå støy"""
-        if not self.memory.waiting_logged:
-            self.node.get_logger().info('⏳ LEDER: Roboten er ved målet og venter på supporter.')
-            self.memory.waiting_logged = True
-
     def is_extinguishing(self) -> bool:
         """Sjekk om vi slukker brannen"""
         return self.memory.is_extinguishing()
 
-    def is_goal_reached(self) -> bool:
-        """Sjekk om mål er nådd"""
-        return self.memory.is_goal_reached()
-
     def publish_big_fire_detection(self, position: tuple):
-        """Leder publiserer Big Fire detection. Logger KUN første gang."""
+        """Leder publiserer Big Fire detection."""
         msg = String()
         msg.data = f"BIG_FIRE_DETECTED:{position[0]}:{position[1]}:{self.robot_id}"
         self.big_fire_pub.publish(msg)
-        
-        # Logg at vi publiserer KUN hvis det er første gang for denne hendelsen
-        if not self.memory.big_fire_logged:
-            self.node.get_logger().info(f'🔥 LEDER: Publiserer Big Fire på {position}')
 
 
-    def publish_robot_at_fire(self):
-        """Leder publiserer at den er ved brannen. Logger KUN ved tilstandsskifte."""
+    def publish_robot_at_fire(self, position: tuple = None):
+        """Leder publiserer at den er ved brannen."""
         msg = String()
-        msg.data = f"{self.robot_id}:AT_FIRE"
+        if position and len(position) >= 2:
+            msg.data = f"{self.robot_id}:AT_FIRE:{float(position[0])}:{float(position[1])}"
+            self.memory.big_fire_position = (float(position[0]), float(position[1]))
+        else:
+            msg.data = f"{self.robot_id}:AT_FIRE"
         self.fire_position_pub.publish(msg)
-        
-        if not self.memory.i_am_at_fire: # Logg kun ved tilstandsskifte
+        if not self.memory.i_am_at_fire:
             self.memory.set_i_am_at_fire(True)
-            self.node.get_logger().info('🔥 LEDER: Publiserer at jeg er ved brannen!')
+        if position and len(position) >= 2:
+            self.node.get_logger().info(f'Sendte AT_FIRE @ ({position[0]:.2f}, {position[1]:.2f})')
+        else:
+            self.node.get_logger().info('Sendte AT_FIRE')
 
     def publish_fire_extinguished(self):
         """Publiserer at brannen er slukket. Logges alltid ved utløsning."""
@@ -215,7 +200,7 @@ class BigFireCoordinator:
         self.memory.set_fire_extinguished(True)
         self.memory.transition_to_normal()
         
-        self.node.get_logger().info('🔥 Brannen slukket! Returnerer til normal utforskning.')
+        self.node.get_logger().info('Brann slukket – tilbake til utforskning')
 
     def reset(self):
         """Reset Big Fire koordinering"""

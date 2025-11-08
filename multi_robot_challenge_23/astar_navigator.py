@@ -12,7 +12,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 from .path_visualizer import PathVisualizer
-from .visited_tracker import VisitedTracker
 from .astar_pathfinder import AStarPathfinder
 from .path_planner import PathPlanner
 from .path_follower import PathFollower
@@ -57,10 +56,9 @@ class AStarNavigator:
         # Setup publisher
         self.cmd_vel_publisher = self.node.create_publisher(Twist, 'cmd_vel', 10)
         
-        # Visuals & tracking (SRP)
+        # Visuals for planned paths
         self.path_visualizer = PathVisualizer(self.node, self.robot_id)
-        self.visited_tracker = VisitedTracker(self.node, self.robot_id, self.occupancy_grid_manager)
-        
+
         # Opprett komponenter
         self.path_planner = PathPlanner(self.node, self.occupancy_grid_manager, leader_position_callback)
         self.path_follower = PathFollower(self.node, self.sensor_manager, self.cmd_vel_publisher)
@@ -139,6 +137,10 @@ class AStarNavigator:
             self.node.get_logger().warn('⭐ A*: Ingen map tilgjengelig for pathfinding.')
             return False
         
+        map_info = self.occupancy_grid_manager.get_map_info() or {}
+        map_height = map_info.get('height', 0)
+        map_width = map_info.get('width', 0)
+        
         if not self.target_position:
             self.node.get_logger().warn('⭐ A*: Ingen target_position satt!')
             return False
@@ -157,7 +159,10 @@ class AStarNavigator:
             self.target_position[0], self.target_position[1]
         )
         
-        self.node.get_logger().info(f'⭐ A*: Map koordinater - start={start_map}, goal={goal_map}')
+        self.node.get_logger().info(
+            f'⭐ A*: start_world={self.robot_position}, goal_world={self.target_position}, '
+            f'start_map={start_map}, goal_map={goal_map}'
+        )
         
         # Debug: Sjekk traversability for start og goal
         start_traversable = self.path_planner.is_traversable(start_map[0], start_map[1])
@@ -165,13 +170,12 @@ class AStarNavigator:
         start_occupancy = self.occupancy_grid_manager.get_occupancy_value(start_map[0], start_map[1])
         goal_occupancy = self.occupancy_grid_manager.get_occupancy_value(goal_map[0], goal_map[1])
         
+        start_in_bounds = 0 <= start_map[0] < map_height and 0 <= start_map[1] < map_width
+        goal_in_bounds = 0 <= goal_map[0] < map_height and 0 <= goal_map[1] < map_width
+        
         self.node.get_logger().info(
-            f'⭐ A* planning: start={start_map}, goal={goal_map}, '
-            f'start_world={self.robot_position}, goal_world={self.target_position}'
-        )
-        self.node.get_logger().info(
-            f'⭐ A* traversability: start_traversable={start_traversable} (occ={start_occupancy}), '
-            f'goal_traversable={goal_traversable} (occ={goal_occupancy})'
+            f'⭐ A* traversability: start_occ={start_occupancy}, goal_occ={goal_occupancy}, '
+            f'start_in_bounds={start_in_bounds}, goal_in_bounds={goal_in_bounds}'
         )
         
         # Viktig: Sjekk at start er traversable
@@ -324,7 +328,6 @@ class AStarNavigator:
         self.viz_counter += 1
         if self.viz_counter % 10 == 0:
             self.path_visualizer.publish(self.path)
-            self.visited_tracker.publish()
         
         # Periodisk replan (kun hvis ikke allerede planlegger og vi har en path)
         now_sec = self.node.get_clock().now().nanoseconds / 1e9
@@ -364,7 +367,7 @@ class AStarNavigator:
             self.planning_in_progress = False
             self.last_plan_time = now_sec
             if not planned:
-                # Ingen path: la koordinatoren falle tilbake til Bug2
+                # Ingen path: la koordinatoren velge alternativ strategi
                 self.path = []
         
         if not self.path:
@@ -442,7 +445,7 @@ class AStarNavigator:
         )
         
         if should_fallback:
-            # Tving fallback til Bug2 i koordinator
+            # Tving koordinatoren til å velge alternativ strategi
             self.node.get_logger().warn('⭐ A*: Front blokkert lenge – tvinger fallback (tømmer path)')
             self.path = []
             self.navigation_active = False
@@ -456,8 +459,6 @@ class AStarNavigator:
         self.recovery_handler.update_progress(distance_to_goal, now_sec)
         
         # Marker nåværende celle som besøkt
-        self.visited_tracker.mark_current(self.robot_position[0], self.robot_position[1])
-        
         return False
     
     def publish_twist(self, linear_x: float, angular_z: float):

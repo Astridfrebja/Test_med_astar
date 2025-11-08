@@ -1,0 +1,6 @@
+image: "package://multi_robot_challenge_23/maps/map_dat160_w1_small200_8bit.png"
+resolution: 0.01
+origin: [-10.0, -10.0, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

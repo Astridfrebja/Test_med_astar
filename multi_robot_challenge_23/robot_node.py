@@ -33,7 +33,7 @@ class MyRobotNode(Node):
         # Initialiser refaktorert search & rescue coordinator
         self.navigation = SearchRescueCoordinator(self)
         
-        self.get_logger().info(f'🔍 S&R ROBOT ({self.robot_id}): Wall Following + BUG2 + GoTo Goal + ArUco Detection + Big Fire Coordination!')
+        self.get_logger().info(f'🔍 S&R ROBOT ({self.robot_id}): Wall Following + GoTo Goal + A* + ArUco Detection + Big Fire Coordination!')
 
 
     def scan_callback(self, msg):

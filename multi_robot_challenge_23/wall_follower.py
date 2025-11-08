@@ -55,7 +55,6 @@ class WallFollower:
             self.STATE_TURN_RIGHT: self.do_turn_right,
         }
         
-        self.node.get_logger().info('🧱 WallFollower initialisert')
 
     def follow_wall(self, msg: LaserScan = None, target_direction=None):
         """
@@ -112,16 +111,6 @@ class WallFollower:
             if elapsed > self.turn_timeout:
                 self.node.get_logger().warn(f"🧱 TURN_LEFT timeout ({elapsed:.1f}s), forcing FOLLOW_WALL")
                 return self.STATE_FOLLOW_WALL
-        
-        # Only log regions when state changes or every 10th call
-        if not hasattr(self, '_log_counter'):
-            self._log_counter = 0
-        self._log_counter += 1
-        
-        if self._log_counter % 50 == 0:  # Log every 50th time
-            self.node.get_logger().info(
-                f"🧱 WallFollower regions: front={d_front:.2f}, right={d_right:.2f}, back_right={d_back_right:.2f}, current_state={self.state}"
-            )
         
         # Vegg foran - må snu unna
         if d_front < self.FRONT_THRESHOLD:
@@ -182,14 +171,6 @@ class WallFollower:
         if new_state != self.state:
             self.state = new_state
             self.state_start_time = self.node.get_clock().now().nanoseconds / 1e9
-            self.node.get_logger().info(f"🧱 State change to: {self.state}")
-
-        state_str = {0: "TURN_LEFT", 1: "FOLLOW_WALL", 2: "TURN_RIGHT"}[self.state]
-        
-        # Only log state when it changes
-        if not hasattr(self, '_last_logged_state') or self._last_logged_state != self.state:
-            self.node.get_logger().info(f"🧱 WallFollower State: {state_str}")
-            self._last_logged_state = self.state
 
         # Get and execute the appropriate action function
         action_function = self.state_actions.get(self.state)
@@ -198,13 +179,6 @@ class WallFollower:
         else:
             self.node.get_logger().warn(f"🧱 Ukjent tilstand: {self.state}. Stopper.")
             twist_msg = Twist()
-
-        # Only log cmd_vel when it changes significantly
-        if not hasattr(self, '_last_cmd_vel') or abs(twist_msg.linear.x - self._last_cmd_vel[0]) > 0.1 or abs(twist_msg.angular.z - self._last_cmd_vel[1]) > 0.1:
-            self.node.get_logger().info(
-                f"🧱 Cmd_vel: linear.x={twist_msg.linear.x:.2f}, angular.z={twist_msg.angular.z:.2f}"
-            )
-            self._last_cmd_vel = (twist_msg.linear.x, twist_msg.angular.z)
 
         self.publish_twist(twist_msg.linear.x, twist_msg.angular.z)
 

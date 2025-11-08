@@ -47,14 +47,14 @@ def generate_launch_description():
         launch_arguments={'world': world_file_path}.items()
     )
 
-    # Map Server
     map_server = Node(
         package='nav2_map_server',
         executable='map_server',
         name='map_server',
         output='screen',
-        parameters=[{"yaml_filename": map_file_path, "topic_name": "map", "frame_id": "map"}],
+        parameters=[{"yaml_filename": map_file_path, "frame_id": "map"}],
     )
+
     
     # Lifecycle Manager
     lifecycle_manager = Node(

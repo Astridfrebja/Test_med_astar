@@ -31,19 +31,10 @@ class RobotMemory:
         self.other_robot_at_fire = False
         self.i_am_at_fire = False
         self.fire_extinguished = False
-        self.big_fire_logged = False
-        self.waiting_logged = False
         
         # Leder & Supporter roles
         self.my_role = None
         self.big_fire_state = self.NORMAL
-        
-        # Wall following state
-        self.is_turning = False
-        
-        # Goal navigation state
-        self.target_position = None
-        self.navigation_active = False
 
         # ArUco processing bookkeeping (avoid duplicate handling)
         self._processed_aruco_ids = set()
@@ -67,7 +58,6 @@ class RobotMemory:
     def transition_to_leder_waiting(self):
         """Transition til Leder venting"""
         self.big_fire_state = self.LEDER_WAITING
-        self.waiting_logged = False  # allow waiting log once when entering state
 
     def transition_to_extinguishing(self):
         """Transition til slukking"""
@@ -78,13 +68,10 @@ class RobotMemory:
         self.big_fire_state = self.NORMAL
         self.big_fire_detected_by_me = False
         self.big_fire_detected_by_other = False
+        self.big_fire_position = None
         self.other_robot_at_fire = False
         self.i_am_at_fire = False
         self.fire_extinguished = False
-        self.big_fire_logged = False
-        self.waiting_logged = False
-        self.target_position = None
-        self.navigation_active = False
 
     def set_other_robot_at_fire(self, value: bool):
         """Sett om annen robot er ved brannen"""
@@ -98,32 +85,13 @@ class RobotMemory:
         """Sett om brannen er slukket"""
         self.fire_extinguished = value
 
-    def set_target_position(self, position: tuple):
-        """Sett målposisjon"""
-        self.target_position = position
-        self.navigation_active = True
-
-    def clear_target_position(self):
-        """Fjern målposisjon"""
-        self.target_position = None
-        self.navigation_active = False
-
-    def set_turning_state(self, is_turning: bool):
-        """Sett turning state"""
-        self.is_turning = is_turning
-
     def should_handle_big_fire(self) -> bool:
         """Sjekk om vi skal håndtere Big Fire koordinering"""
-        result = (self.big_fire_detected_by_me or 
-                  self.big_fire_detected_by_other or 
-                  self.big_fire_state != self.NORMAL)
-        
-        # Kun print ved tilstandsendring for å redusere støy
-        if not hasattr(self, '_last_should_handle') or self._last_should_handle != result:
-            print(f"🔥 should_handle_big_fire: detected_by_me={self.big_fire_detected_by_me}, detected_by_other={self.big_fire_detected_by_other}, state={self.big_fire_state}, result={result}")
-            self._last_should_handle = result
-        
-        return result
+        return (
+            self.big_fire_detected_by_me
+            or self.big_fire_detected_by_other
+            or self.big_fire_state != self.NORMAL
+        )
 
     # --- Convenience helpers used by coordinator ---
     def is_moving_to_fire(self) -> bool:
@@ -133,14 +101,10 @@ class RobotMemory:
     def transition_to_leder_going_to_fire(self):
         """Sett state når leder skal gå mot brannen."""
         self.big_fire_state = self.LEDER_GOING_TO_FIRE
-        self.target_position = self.big_fire_position
-        self.navigation_active = True
 
     def transition_to_supporter_going_to_fire(self):
         """Sett state når supporter skal gå mot brannen."""
         self.big_fire_state = self.SUPPORTER_GOING_TO_FIRE
-        self.target_position = self.big_fire_position
-        self.navigation_active = True
 
     def is_leder_waiting(self) -> bool:
         """Sjekk om Leder venter"""
@@ -158,18 +122,6 @@ class RobotMemory:
         """Sjekk om Supporter går til brannen"""
         return self.big_fire_state == self.SUPPORTER_GOING_TO_FIRE
 
-    def get_target_position(self) -> tuple:
-        """Hent målposisjon"""
-        return self.target_position
-
-    def is_navigation_active(self) -> bool:
-        """Sjekk om navigasjon er aktiv"""
-        return self.navigation_active
-
-    def is_goal_reached(self) -> bool:
-        """Sjekk om mål er nådd"""
-        return self.big_fire_state in [self.LEDER_WAITING, self.EXTINGUISHING]
-
     def update_robot_pose(self, position: tuple, orientation: float):
         """Oppdater robot posisjon og orientering"""
         self.robot_position = position
@@ -185,10 +137,6 @@ class RobotMemory:
         self.fire_extinguished = False
         self.my_role = None
         self.big_fire_state = self.NORMAL
-        self.big_fire_logged = False
-        self.waiting_logged = False
-        self.target_position = None
-        self.navigation_active = False
 
     # --- ArUco processing helpers ---
     def is_aruco_processed(self, marker_id: int) -> bool:
