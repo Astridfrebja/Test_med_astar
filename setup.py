@@ -33,6 +33,7 @@ setup(
             'robot_node = multi_robot_challenge_23.robot_node:main',
             'scoring = scoring.scoring:main',
             'map_debug_checker = multi_robot_challenge_23.map_debug_checker:main',
+            'map_debug_qos = multi_robot_challenge_23.map_debug_qos:main',
         ],
     },
 )
