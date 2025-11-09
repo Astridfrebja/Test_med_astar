@@ -52,7 +52,11 @@ def generate_launch_description():
         executable='map_server',
         name='map_server',
         output='screen',
-        parameters=[{"yaml_filename": map_file_path, "frame_id": "map"}],
+        parameters=[{
+            "yaml_filename": map_file_path,
+            "topic_name": "map",   #
+            "frame_id": "map"
+        }],
     )
 
     
@@ -64,6 +68,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{'use_sim_time': use_sim_time},
                     {'autostart': True},
+                    {'bond_timeout': 0.0},
                     {'node_names': ["map_server"]}]
     )
 
@@ -109,6 +114,40 @@ def generate_launch_description():
         output='screen'
     )
 
+    # Debug node som sjekker at /map faktisk publiseres
+    debug_node = Node(
+        package='rclpy',
+        executable='rclpy',
+        name='map_debug_checker',
+        output='screen',
+        arguments=['-c', """
+    import rclpy, time
+    from rclpy.node import Node
+    from nav_msgs.msg import OccupancyGrid
+
+    rclpy.init()
+    node = Node('map_debug_checker')
+    msg_received = False
+
+    def cb(msg):
+        global msg_received
+        msg_received = True
+        node.get_logger().info(f'✅ Map mottatt: {msg.info.width}x{msg.info.height}, res={msg.info.resolution}')
+        node.destroy_subscription(sub)
+
+    sub = node.create_subscription(OccupancyGrid, '/map', cb, 10)
+
+    start = time.time()
+    while rclpy.ok() and time.time() - start < 5 and not msg_received:
+        rclpy.spin_once(node, timeout_sec=0.5)
+
+    if not msg_received:
+        node.get_logger().error('❌ Ingen /map-data mottatt etter 5 sekunder!')
+    rclpy.shutdown()
+    """]
+    )
+
+
     # Robot Kontroller-Noder
     robot1_node = Node(
         package=package_name,
@@ -137,6 +176,7 @@ def generate_launch_description():
         tb3_0,
         tb3_1,
         rviz_node,
+        debug_node,
         robot1_node,
         robot2_node,
     ]

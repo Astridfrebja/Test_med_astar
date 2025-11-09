@@ -1,6 +1,7 @@
-image: map_dat160_w1.png
+image: /home/rocotics/ros2_ws/install/multi_robot_challenge_23/share/multi_robot_challenge_23/maps/map_dat160_w1_gray.png
 resolution: 0.01
-origin: [-10.0, -10.0, 0]
+origin: [-10.0, -10.0, 0.0]
+negate: 0
 occupied_thresh: 0.65
 free_thresh: 0.196
-negate: 0
+
